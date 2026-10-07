@@ -1,0 +1,218 @@
+#==============================================================================================
+#
+#   nn/conv - Conv and ConvTranspose in 2D
+#
+#   DESCRIPTION:
+#       Conv lays each output position's receptive field out as a column (im2col) and
+#       multiplies the weights by the columns: per group, weights (m × c·kh·kw) times
+#       columns (c·kh·kw × positions). The columns are made for a band of output rows
+#       at a time, so a 3×3 convolution over a full-size feature map needs a few
+#       megabytes of scratch, not hundreds. A 1×1 convolution with no stride or padding
+#       multiplies the input itself.
+#
+#       ConvTranspose runs the other way: the transposed weights times the input give
+#       each input position's contribution to a kernel-sized patch of the output, added
+#       into place (col2im).
+#
+#       Attributes: strides, pads (top, left, bottom, right), dilations, group,
+#       output_padding; auto_pad only NOTSET (the exporters' default).
+#
+#==============================================================================================
+
+## The most floats of im2col scratch a band uses.
+let band_floats: usize = 1 << 22
+
+## A 2D convolution's geometry.
+struct Window:
+    var kernel_h: usize
+    var kernel_w: usize
+    var stride_h: usize
+    var stride_w: usize
+    var pad_top: usize
+    var pad_left: usize
+    var pad_bottom: usize
+    var pad_right: usize
+    var dilation_h: usize
+    var dilation_w: usize
+    var group: usize
+
+extend Model:
+    func window_of(node: const Node*, kernel: const Tensor*) -> Window!:
+        if self.text_attribute(node, "auto_pad", "NOTSET") != "NOTSET":
+            error(unsupported, "a convolution with auto_pad")
+        var out = Window(kernel_h = (usize)kernel.dims[2], kernel_w = (usize)kernel.dims[3], stride_h = 1, stride_w = 1,
+                         dilation_h = 1, dilation_w = 1, group = (usize)self.int_attribute(node, "group", 1))
+        if let strides = self.ints_attribute(node, "strides"):
+            out.stride_h = (usize)strides[0]
+            out.stride_w = (usize)strides[1]
+        if let pads = self.ints_attribute(node, "pads"):
+            out.pad_top = (usize)pads[0]
+            out.pad_left = (usize)pads[1]
+            out.pad_bottom = (usize)pads[2]
+            out.pad_right = (usize)pads[3]
+        if let dilations = self.ints_attribute(node, "dilations"):
+            out.dilation_h = (usize)dilations[0]
+            out.dilation_w = (usize)dilations[1]
+        if out.group == 0 or out.stride_h == 0 or out.stride_w == 0 or out.dilation_h == 0 or out.dilation_w == 0:
+            error(invalid, "a convolution's group, strides or dilations are zero")
+        return out
+
+    func conv_node(node: const Node*) -> Tensor!:
+        let x = try self.needed(node, 0)
+        let w = try self.needed(node, 1)
+        if x.rank != 4 or w.rank != 4 or x.dtype != DType.float32:
+            error(unsupported, "a convolution that is not 2D float32")
+        return try conv(x, w, self.input(node, 2), try self.window_of(node, w))
+
+    func conv_transpose_node(node: const Node*) -> Tensor!:
+        let x = try self.needed(node, 0)
+        let w = try self.needed(node, 1)
+        if x.rank != 4 or w.rank != 4 or x.dtype != DType.float32:
+            error(unsupported, "a transposed convolution that is not 2D float32")
+        var extra: i64[2] = [0, 0]
+        if let padding = self.ints_attribute(node, "output_padding"):
+            extra[0] = padding[0]
+            extra[1] = padding[1]
+        if self.ints_attribute(node, "output_shape") != none:
+            error(unsupported, "a transposed convolution with output_shape")
+        return try conv_transpose(x, w, self.input(node, 2), try self.window_of(node, w), extra)
+
+func conv(x: const Tensor*, w: const Tensor*, bias: const Tensor*?, window: Window) -> Tensor!:
+    let batch = (usize)x.dims[0]
+    let channels = (usize)x.dims[1]
+    let height = (usize)x.dims[2]
+    let width = (usize)x.dims[3]
+    let outputs = (usize)w.dims[0]
+    let group = window.group
+    let group_in = channels // group
+    let group_out = outputs // group
+    if channels % group != 0 or outputs % group != 0 or (usize)w.dims[1] != group_in:
+        error(invalid, "a convolution's channels do not fit its weights")
+    let reach_h = window.dilation_h * (window.kernel_h - 1) + 1
+    let reach_w = window.dilation_w * (window.kernel_w - 1) + 1
+    if height + window.pad_top + window.pad_bottom < reach_h or width + window.pad_left + window.pad_right < reach_w:
+        error(invalid, "a convolution's kernel is larger than its padded input")
+    let out_h = (height + window.pad_top + window.pad_bottom - reach_h) // window.stride_h + 1
+    let out_w = (width + window.pad_left + window.pad_right - reach_w) // window.stride_w + 1
+    var dims: i64[4] = [(i64)batch, (i64)outputs, (i64)out_h, (i64)out_w]
+    var out = try Tensor.float32(dims)
+    errdefer out.release()
+    let field = group_in * window.kernel_h * window.kernel_w
+    let plain = window.kernel_h == 1 and window.kernel_w == 1 and window.stride_h == 1 and window.stride_w == 1 and window.pad_top == 0 and window.pad_left == 0 and window.pad_bottom == 0 and window.pad_right == 0
+    # Output rows per band, so a band's columns stay under band_floats.
+    var band = band_floats // (field * out_w) if field * out_w > 0 else out_h
+    band = 1 if band < 1 else (out_h if band > out_h else band)
+    var columns = try new f32[field * band * out_w] --- in memory.heap
+    defer free(columns) in memory.heap
+    var product = try new f32[group_out * band * out_w] --- in memory.heap
+    defer free(product) in memory.heap
+    let plane = out_h * out_w
+    for n in 0..<batch:
+        for g in 0..<group:
+            let weights = w.floats[g * group_out * field..<(g + 1) * group_out * field]
+            let input = x.floats[(n * channels + g * group_in) * height * width..<(n * channels + (g + 1) * group_in) * height * width]
+            if plain:
+                let target = out.floats[(n * outputs + g * group_out) * plane..<(n * outputs + (g + 1) * group_out) * plane]
+                try gemm(weights, input, target, group_out, plane, group_in)
+                continue
+            var row: usize = 0
+            while row < out_h:
+                let rows = band if row + band <= out_h else out_h - row
+                let positions = rows * out_w
+                im2col(input, columns[..<field * positions], group_in, height, width, window, row, rows, out_w)
+                try gemm(weights, columns[..<field * positions], product[..<group_out * positions], group_out, positions, field)
+                for o in 0..<group_out:
+                    let target = (n * outputs + g * group_out + o) * plane + row * out_w
+                    memory.copy(out.floats[target..<target + positions], product[o * positions..<(o + 1) * positions], positions)
+                row += rows
+    if let b = bias:
+        add_bias(out.floats, b.floats, batch, outputs, plane)
+    return out
+
+## Columns for output rows `row..<row + rows`: per input channel and kernel tap, the
+## input value each output position reads (0 in the padding), positions along a row.
+func im2col(input: const f32[], columns: f32[], channels: usize, height: usize, width: usize, window: Window, row: usize, rows: usize, out_w: usize):
+    let positions = rows * out_w
+    var at: usize = 0
+    for channel in 0..<channels:
+        let plane = input[channel * height * width..<(channel + 1) * height * width]
+        for ky in 0..<window.kernel_h:
+            for kx in 0..<window.kernel_w:
+                let target = columns[at * positions..<(at + 1) * positions]
+                at += 1
+                for r in 0..<rows:
+                    let y = (i64)((row + r) * window.stride_h + ky * window.dilation_h) - (i64)window.pad_top
+                    let line = target[r * out_w..<(r + 1) * out_w]
+                    if y < 0 or y >= (i64)height:
+                        for column in 0..<out_w:
+                            line[column] = 0.0
+                        continue
+                    let source = plane[(usize)y * width..<((usize)y + 1) * width]
+                    let x0 = (i64)(kx * window.dilation_w) - (i64)window.pad_left
+                    if window.stride_w == 1 and x0 >= 0 and x0 + (i64)out_w <= (i64)width:
+                        memory.copy(line, source[(usize)x0..<(usize)x0 + out_w], out_w)
+                        continue
+                    for column in 0..<out_w:
+                        let x = x0 + (i64)(column * window.stride_w)
+                        line[column] = source[(usize)x] if x >= 0 and x < (i64)width else 0.0
+
+func add_bias(data: f32[], bias: const f32[], batch: usize, channels: usize, plane: usize):
+    for n in 0..<batch:
+        for channel in 0..<channels:
+            let value = bias[channel]
+            let target = data[(n * channels + channel) * plane..<(n * channels + channel + 1) * plane]
+            for at in 0..<plane:
+                target[at] = target[at] + value
+
+func conv_transpose(x: const Tensor*, w: const Tensor*, bias: const Tensor*?, window: Window, extra: i64[2]) -> Tensor!:
+    let batch = (usize)x.dims[0]
+    let channels = (usize)x.dims[1]
+    let height = (usize)x.dims[2]
+    let width = (usize)x.dims[3]
+    let group = window.group
+    let group_in = channels // group
+    let group_out = (usize)w.dims[1]
+    let outputs = group_out * group
+    if channels % group != 0 or (usize)w.dims[0] != channels:
+        error(invalid, "a transposed convolution's channels do not fit its weights")
+    let full_h = window.stride_h * (height - 1) + (usize)extra[0] + window.dilation_h * (window.kernel_h - 1) + 1
+    let full_w = window.stride_w * (width - 1) + (usize)extra[1] + window.dilation_w * (window.kernel_w - 1) + 1
+    if full_h < window.pad_top + window.pad_bottom + 1 or full_w < window.pad_left + window.pad_right + 1:
+        error(invalid, "a transposed convolution's padding is larger than its output")
+    let out_h = full_h - window.pad_top - window.pad_bottom
+    let out_w = full_w - window.pad_left - window.pad_right
+    var dims: i64[4] = [(i64)batch, (i64)outputs, (i64)out_h, (i64)out_w]
+    var out = try Tensor.float32(dims)
+    errdefer out.release()
+    let taps = window.kernel_h * window.kernel_w
+    let rows = group_out * taps
+    let positions = height * width
+    # Per group: the weights transposed, (group_out·taps) × group_in.
+    var transposed = try new f32[rows * group_in] --- in memory.heap
+    defer free(transposed) in memory.heap
+    var patches = try new f32[rows * positions] --- in memory.heap
+    defer free(patches) in memory.heap
+    for g in 0..<group:
+        for i in 0..<group_in:
+            for r in 0..<rows:
+                transposed[r * group_in + i] = w.floats[(g * group_in + i) * rows + r]
+        for n in 0..<batch:
+            let input = x.floats[(n * channels + g * group_in) * positions..<(n * channels + (g + 1) * group_in) * positions]
+            try gemm(transposed, input, patches, rows, positions, group_in)
+            # Each input position's patch, added into the output.
+            for o in 0..<group_out:
+                let plane = out.floats[(n * outputs + g * group_out + o) * out_h * out_w..<(n * outputs + g * group_out + o + 1) * out_h * out_w]
+                for ky in 0..<window.kernel_h:
+                    for kx in 0..<window.kernel_w:
+                        let source = patches[((o * window.kernel_h + ky) * window.kernel_w + kx) * positions..<((o * window.kernel_h + ky) * window.kernel_w + kx + 1) * positions]
+                        for y in 0..<height:
+                            let oy = (i64)(y * window.stride_h + ky * window.dilation_h) - (i64)window.pad_top
+                            if oy < 0 or oy >= (i64)out_h:
+                                continue
+                            for column in 0..<width:
+                                let ox = (i64)(column * window.stride_w + kx * window.dilation_w) - (i64)window.pad_left
+                                if ox >= 0 and ox < (i64)out_w:
+                                    plane[(usize)oy * out_w + (usize)ox] += source[y * width + column]
+    if let b = bias:
+        add_bias(out.floats, b.floats, batch, outputs, out_h * out_w)
+    return out

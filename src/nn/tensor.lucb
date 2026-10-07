@@ -1,0 +1,134 @@
+#==============================================================================================
+#
+#   nn/tensor - Tensors: an element type, a shape and owned, dense, row-major data
+#
+#==============================================================================================
+
+## The most dimensions a tensor has.
+pub let most_dims: usize = 8
+
+## Element types, numbered as ONNX's TensorProto.DataType.
+pub enum DType as i64:
+    float32 = 1
+    int64 = 7
+    boolean = 9
+
+## A tensor. Float32 data is in `floats`; int64 and bool (0 or 1) in `ints`. An absent
+## tensor (`present` false) holds nothing: an omitted optional input, or a value not
+## made yet.
+pub struct Tensor:
+    pub var dtype: DType = DType.float32
+    pub var rank: usize
+    pub var dims: i64[8]
+    pub var floats: f32[]
+    pub var ints: i64[]
+    pub var present: bool
+
+    ## A float32 tensor of shape `dims`, zeroed.
+    pub static func float32(dims: const i64[]) -> Tensor!:
+        var out = try Tensor.shaped(DType.float32, dims)
+        out.floats = try new f32[out.elements()] in memory.heap
+        return out
+
+    ## An int64 (or, with `dtype`, bool) tensor of shape `dims`, zeroed.
+    pub static func int64(dims: const i64[], dtype: DType = DType.int64) -> Tensor!:
+        var out = try Tensor.shaped(dtype, dims)
+        out.ints = try new i64[out.elements()] in memory.heap
+        return out
+
+    ## A tensor of `dtype` and shape `dims`, its data allocated (zeroed).
+    static func of(dtype: DType, dims: const i64[]) -> Tensor!:
+        if dtype == DType.float32:
+            return try Tensor.float32(dims)
+        return try Tensor.int64(dims, dtype)
+
+    static func shaped(dtype: DType, dims: const i64[]) -> Tensor!:
+        if dims.length > most_dims:
+            error(unsupported, "a tensor has more than eight dimensions")
+        var out = Tensor(dtype = dtype, rank = dims.length, present = true)
+        var total: i64 = 1
+        for (at, dim) in dims.indexed():
+            if dim < 0:
+                error(invalid, "a tensor's dimension is negative")
+            out.dims[at] = dim
+            total = total *? dim else error(invalid, "a tensor is too large")
+        if total > 1 << 40:
+            error(invalid, "a tensor is too large")
+        return out
+
+    ## How many elements it holds.
+    pub func elements() -> usize:
+        var total: usize = 1
+        for at in 0..<self.rank:
+            total *= (usize)self.dims[at]
+        return total
+
+    ## Its shape as a view.
+    pub func shape() -> const i64[]:
+        return self.dims[..<self.rank]
+
+    ## Dimension `axis`, counted from the end when negative.
+    pub func dim(axis: i64) -> i64:
+        return self.dims[(usize)(axis + (i64)self.rank if axis < 0 else axis)]
+
+    ## A copy with its own data.
+    func copy() -> Tensor!:
+        var out = try Tensor.of(self.dtype, self.shape())
+        if self.dtype == DType.float32:
+            memory.copy(out.floats, self.floats, self.floats.length)
+        else:
+            memory.copy(out.ints, self.ints, self.ints.length)
+        return out
+
+    ## Element `at` as a float, whatever its type.
+    func float_at(at: usize) -> f64:
+        return (f64)self.floats[at] if self.dtype == DType.float32 else (f64)self.ints[at]
+
+    ## Element `at` as an integer, whatever its type.
+    func int_at(at: usize) -> i64:
+        return (i64)self.floats[at] if self.dtype == DType.float32 else self.ints[at]
+
+    pub func release():
+        if self.floats.length > 0:
+            free(self.floats) in memory.heap
+        if self.ints.length > 0:
+            free(self.ints) in memory.heap
+        var no_floats: f32[]
+        var no_ints: i64[]
+        self.floats = no_floats
+        self.ints = no_ints
+        self.rank = 0
+        self.present = false
+
+## Row-major strides of `dims` (elements), into `out`.
+func strides_of(dims: const i64[], out: i64[]):
+    var stride: i64 = 1
+    var at = dims.length
+    while at > 0:
+        at -= 1
+        out[at] = stride
+        stride *= dims[at]
+
+## The shape `a` and `b` broadcast to (numpy's rule: align from the right; a dimension
+## of 1 stretches), into `out`; its rank.
+func broadcast(a: const i64[], b: const i64[], out: i64[]) -> usize!:
+    let rank = a.length if a.length > b.length else b.length
+    for at in 0..<rank:
+        let x = a[a.length + at - rank] if at + a.length >= rank else 1
+        let y = b[b.length + at - rank] if at + b.length >= rank else 1
+        if x != y and x != 1 and y != 1:
+            error(invalid, "shapes do not broadcast")
+        out[at] = x if y == 1 else y
+    return rank
+
+## The strides with which a tensor of shape `dims` is read when broadcast to rank
+## `rank`: 0 along stretched or added dimensions.
+func broadcast_strides(dims: const i64[], rank: usize, out: i64[]):
+    var own: i64[8]
+    strides_of(dims, own)
+    for at in 0..<rank:
+        if at + dims.length < rank:
+            out[at] = 0
+        else:
+            let source = at + dims.length - rank
+            out[at] = 0 if dims[source] == 1 else own[source]

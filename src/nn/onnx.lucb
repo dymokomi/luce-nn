@@ -1,0 +1,357 @@
+#==============================================================================================
+#
+#   nn/onnx - ONNX's ModelProto into a Model
+#
+#   DESCRIPTION:
+#       The fields read, by number (onnx.proto3):
+#
+#       ModelProto       7 graph, 8 opset_import (OperatorSetIdProto: 1 domain, 2 version)
+#       GraphProto       1 node, 5 initializer, 11 input, 12 output (ValueInfoProto: 1 name)
+#       NodeProto        1 input, 2 output, 3 name, 4 op_type, 5 attribute, 7 domain
+#       AttributeProto   1 name, 2 f, 3 i, 4 s, 5 t, 7 floats, 8 ints
+#       TensorProto      1 dims, 2 data_type, 4 float_data, 5 int32_data, 7 int64_data,
+#                        8 name, 9 raw_data, 14 data_location
+#
+#       A graph's fields may come in any order and exporters write nodes before
+#       initializers, so the graph is read three times: weights and inputs, then nodes
+#       (each naming the values it reads and makes), then outputs. Weights stored outside
+#       the file (data_location EXTERNAL) and operator domains other than the default
+#       are refused.
+#
+#==============================================================================================
+
+## The operators run, by ONNX name.
+enum Op as i64:
+    add = 0
+    sub = 1
+    mul = 2
+    div = 3
+    pow = 4
+    sqrt = 5
+    relu = 6
+    erf = 7
+    equal = 8
+    where_of = 9
+    matmul = 10
+    reduce_mean = 11
+    softmax = 12
+    shape = 13
+    reshape = 14
+    transpose = 15
+    concat = 16
+    gather = 17
+    slice = 18
+    unsqueeze = 19
+    squeeze = 20
+    expand = 21
+    conv = 22
+    conv_transpose = 23
+    resize = 24
+    constant = 25
+    sigmoid = 26
+    tanh_of = 27
+    exp_of = 28
+    neg = 29
+    identity = 30
+
+func op_named(name: str) -> Op?:
+    return match name:
+        "Add" => Op.add
+        "Sub" => Op.sub
+        "Mul" => Op.mul
+        "Div" => Op.div
+        "Pow" => Op.pow
+        "Sqrt" => Op.sqrt
+        "Relu" => Op.relu
+        "Erf" => Op.erf
+        "Equal" => Op.equal
+        "Where" => Op.where_of
+        "MatMul" => Op.matmul
+        "ReduceMean" => Op.reduce_mean
+        "Softmax" => Op.softmax
+        "Shape" => Op.shape
+        "Reshape" => Op.reshape
+        "Transpose" => Op.transpose
+        "Concat" => Op.concat
+        "Gather" => Op.gather
+        "Slice" => Op.slice
+        "Unsqueeze" => Op.unsqueeze
+        "Squeeze" => Op.squeeze
+        "Expand" => Op.expand
+        "Conv" => Op.conv
+        "ConvTranspose" => Op.conv_transpose
+        "Resize" => Op.resize
+        "Constant" => Op.constant
+        "Sigmoid" => Op.sigmoid
+        "Tanh" => Op.tanh_of
+        "Exp" => Op.exp_of
+        "Neg" => Op.neg
+        "Identity" => Op.identity
+        _ => none
+
+## One node: its operator, and ranges of the model's edges and attributes.
+struct Node:
+    var op: Op
+    var name: str
+    var first_input: usize
+    var input_count: usize
+    var first_output: usize
+    var output_count: usize
+    var first_attribute: usize
+    var attribute_count: usize
+
+## One attribute: a number, a text, a list (`list` 1 ints, 2 floats: `first` and
+## `length` in the model's ints or floats) or a tensor (`tensor`, a value slot).
+struct Attribute:
+    var name: str
+    var number: i64
+    var real: f32
+    var text: str
+    var list: i64
+    var first: usize
+    var length: usize
+    var tensor: i64
+
+extend Model:
+    func parse() -> !:
+        var wire = Wire(data = self.file)
+        var graph: const u8[]? = none
+        var version: i64 = 0
+        while not wire.done():
+            let (field, kind) = try wire.key()
+            if field == 7 and kind == wire_bytes:
+                graph = try wire.bytes()
+            elif field == 8 and kind == wire_bytes:
+                var opset = Wire(data = try wire.bytes())
+                var domain = ""
+                var number: i64 = 0
+                while not opset.done():
+                    let (inner, inner_kind) = try opset.key()
+                    if inner == 1 and inner_kind == wire_bytes:
+                        domain = (str)(try opset.bytes())
+                    elif inner == 2 and inner_kind == wire_varint:
+                        number = signed(try opset.varint())
+                    else:
+                        try opset.skip(inner_kind)
+                if domain == "" or domain == "ai.onnx":
+                    version = number
+            else:
+                try wire.skip(kind)
+        let body = graph else error(malformed, "the file holds no ONNX graph")
+        if version != 0 and version < 13:
+            error(unsupported, "the model's opset is older than 13")
+        try self.read_graph(body)
+
+    func read_graph(body: const u8[]) -> !:
+        # Weights and runtime inputs first: nodes name them.
+        var wire = Wire(data = body)
+        var declared: List[str]
+        defer declared.destroy()
+        while not wire.done():
+            let (field, kind) = try wire.key()
+            if field == 5 and kind == wire_bytes:
+                try self.read_initializer(try wire.bytes())
+            elif field == 11 and kind == wire_bytes:
+                try declared.append(try value_name(try wire.bytes()))
+            else:
+                try wire.skip(kind)
+        for name in declared.view():
+            let slot = try self.slot(name)
+            if not self.constant.at((usize)slot):
+                try self.inputs.append(slot)
+        wire = Wire(data = body)
+        while not wire.done():
+            let (field, kind) = try wire.key()
+            if field == 1 and kind == wire_bytes:
+                try self.read_node(try wire.bytes())
+            else:
+                try wire.skip(kind)
+        wire = Wire(data = body)
+        while not wire.done():
+            let (field, kind) = try wire.key()
+            if field == 12 and kind == wire_bytes:
+                try self.outputs.append(try self.slot(try value_name(try wire.bytes())))
+            else:
+                try wire.skip(kind)
+        if self.outputs.length() == 0:
+            error(malformed, "the graph has no outputs")
+
+    ## The value slot named `name`, made when it is new.
+    func slot(name: str) -> i64!:
+        if let found = self.names.find(name):
+            return found
+        let slot = (i64)self.values.length()
+        try self.values.append(Tensor())
+        try self.constant.append(false)
+        try self.value_names.append(name)
+        try self.last_use.append(-1)
+        try self.names.insert(name, slot)
+        return slot
+
+    func read_initializer(data: const u8[]) -> !:
+        var tensor = try read_tensor(data, &self.ints)
+        errdefer tensor.tensor.release()
+        let slot = try self.slot(tensor.name)
+        self.values.set((usize)slot, tensor.tensor)
+        self.constant.set((usize)slot, true)
+
+    func read_node(data: const u8[]) -> !:
+        var wire = Wire(data = data)
+        var node = Node(first_input = self.edges.length(), first_attribute = self.attributes.length())
+        var op_name = ""
+        var domain = ""
+        var outputs: List[str]
+        defer outputs.destroy()
+        # Inputs come before outputs in the edges; outputs are gathered, then appended.
+        while not wire.done():
+            let (field, kind) = try wire.key()
+            if field == 1 and kind == wire_bytes:
+                let name = (str)(try wire.bytes())
+                try self.edges.append(-1 if name == "" else try self.slot(name))
+                node.input_count += 1
+            elif field == 2 and kind == wire_bytes:
+                try outputs.append((str)(try wire.bytes()))
+            elif field == 3 and kind == wire_bytes:
+                node.name = (str)(try wire.bytes())
+            elif field == 4 and kind == wire_bytes:
+                op_name = (str)(try wire.bytes())
+            elif field == 5 and kind == wire_bytes:
+                try self.read_attribute(try wire.bytes())
+                node.attribute_count += 1
+            elif field == 7 and kind == wire_bytes:
+                domain = (str)(try wire.bytes())
+            else:
+                try wire.skip(kind)
+        if domain != "" and domain != "ai.onnx":
+            error(unsupported, "the model uses an operator outside ONNX's default domain")
+        node.op = op_named(op_name) else error(unsupported, "the model uses an operator luce-nn does not run")
+        node.first_output = self.edges.length()
+        for name in outputs.view():
+            try self.edges.append(-1 if name == "" else try self.slot(name))
+            node.output_count += 1
+        try self.nodes.append(node)
+
+    func read_attribute(data: const u8[]) -> !:
+        var wire = Wire(data = data)
+        var attribute = Attribute(tensor = -1)
+        while not wire.done():
+            let (field, kind) = try wire.key()
+            if field == 1 and kind == wire_bytes:
+                attribute.name = (str)(try wire.bytes())
+            elif field == 2 and kind == wire_fixed32:
+                attribute.real = float_of_bits(try wire.fixed32())
+            elif field == 3 and kind == wire_varint:
+                attribute.number = signed(try wire.varint())
+            elif field == 4 and kind == wire_bytes:
+                attribute.text = (str)(try wire.bytes())
+            elif field == 5 and kind == wire_bytes:
+                var tensor = try read_tensor(try wire.bytes(), &self.ints)
+                errdefer tensor.tensor.release()
+                # An attribute's tensor is a constant value of its own, unnamed.
+                let slot = (i64)self.values.length()
+                try self.values.append(tensor.tensor)
+                try self.constant.append(true)
+                try self.value_names.append("")
+                try self.last_use.append(-1)
+                attribute.tensor = slot
+            elif field == 7:
+                if attribute.list == 0:
+                    attribute.list = 2
+                    attribute.first = self.floats.length()
+                try read_floats(&wire, kind, &self.floats)
+                attribute.length = self.floats.length() - attribute.first
+            elif field == 8:
+                if attribute.list == 0:
+                    attribute.list = 1
+                    attribute.first = self.ints.length()
+                try read_ints(&wire, kind, &self.ints)
+                attribute.length = self.ints.length() - attribute.first
+            else:
+                try wire.skip(kind)
+        try self.attributes.append(attribute)
+
+## A ValueInfoProto's name.
+func value_name(data: const u8[]) -> str!:
+    var wire = Wire(data = data)
+    while not wire.done():
+        let (field, kind) = try wire.key()
+        if field == 1 and kind == wire_bytes:
+            return (str)(try wire.bytes())
+        try wire.skip(kind)
+    error(malformed, "a graph input or output has no name")
+
+## A TensorProto and its name.
+struct Named:
+    var name: str
+    var tensor: Tensor
+
+## Read a TensorProto. `scratch` holds its dims while they are gathered (and is
+## left as it was).
+func read_tensor(data: const u8[], scratch: List[i64]*) -> Named!:
+    var wire = Wire(data = data)
+    let mark = scratch.length()
+    defer scratch.truncate(mark)
+    var data_type: i64 = 0
+    var name = ""
+    var raw: const u8[]? = none
+    var listed_floats: List[f32]
+    defer listed_floats.destroy()
+    var listed_ints: List[i64]
+    defer listed_ints.destroy()
+    while not wire.done():
+        let (field, kind) = try wire.key()
+        if field == 1:
+            try read_ints(&wire, kind, scratch)
+        elif field == 2 and kind == wire_varint:
+            data_type = signed(try wire.varint())
+        elif field == 4:
+            try read_floats(&wire, kind, &listed_floats)
+        elif field == 5 or field == 7:
+            try read_ints(&wire, kind, &listed_ints)
+        elif field == 8 and kind == wire_bytes:
+            name = (str)(try wire.bytes())
+        elif field == 9 and kind == wire_bytes:
+            raw = try wire.bytes()
+        elif field == 14 and kind == wire_varint:
+            if try wire.varint() != 0:
+                error(unsupported, "the model keeps weights in an external file")
+        else:
+            try wire.skip(kind)
+    let dims = scratch.view()[mark..]
+    var out: Tensor
+    if data_type == 1:
+        out = try Tensor.float32(dims)
+        errdefer out.release()
+        let count = out.elements()
+        if let bytes = raw:
+            if bytes.length != count * 4:
+                error(malformed, "a float tensor's data does not fill its shape")
+            memory.copy(u8[]((u8*)out.floats.data, count * 4), bytes, count * 4)
+        elif listed_floats.length() == count:
+            memory.copy(out.floats, listed_floats.view(), count)
+        elif count != 0:
+            error(malformed, "a float tensor's data does not fill its shape")
+    elif data_type == 7 or data_type == 6 or data_type == 9:
+        let dtype = DType.boolean if data_type == 9 else DType.int64
+        out = try Tensor.int64(dims, dtype)
+        errdefer out.release()
+        let count = out.elements()
+        let width: usize = 8 if data_type == 7 else (4 if data_type == 6 else 1)
+        if let bytes = raw:
+            if bytes.length != count * width:
+                error(malformed, "an integer tensor's data does not fill its shape")
+            for at in 0..<count:
+                var value: i64 = 0
+                for byte in 0..<width:
+                    value |= (i64)bytes[at * width + byte] << (i64)(byte * 8)
+                # Sign-extend 32-bit values.
+                if width == 4 and value >= 1 << 31:
+                    value -= 1 << 32
+                out.ints[at] = value
+        elif listed_ints.length() == count:
+            memory.copy(out.ints, listed_ints.view(), count)
+        elif count != 0:
+            error(malformed, "an integer tensor's data does not fill its shape")
+    else:
+        error(unsupported, "the model holds a tensor of an element type luce-nn does not run")
+    return Named(name = name, tensor = out)

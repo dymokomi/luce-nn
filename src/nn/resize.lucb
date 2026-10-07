@@ -1,0 +1,160 @@
+#==============================================================================================
+#
+#   nn/resize - Resize on the last two axes: nearest, linear and cubic
+#
+#   DESCRIPTION:
+#       The output size comes from `sizes`, else the input's times `scales` (floored).
+#       Only the last two axes may change size (images: N, C, H, W). Each axis gets a
+#       table of taps, which input indices an output index reads and with what weights,
+#       from the coordinate transformation (half_pixel, pytorch_half_pixel,
+#       align_corners, asymmetric) and the mode; the image is then filtered across, then
+#       down. Linear and cubic read clamped indices at the edges (exclude_outside 0);
+#       cubic uses cubic_coeff_a (-0.75 by default, as onnxruntime and PyTorch).
+#
+#==============================================================================================
+
+## Up to four taps per output index.
+struct Taps:
+    var first: i64[4]
+    var weights: f32[4]
+    var count: usize
+
+extend Model:
+    func resize_node(node: const Node*) -> Tensor!:
+        let x = try self.needed(node, 0)
+        if x.dtype != DType.float32:
+            error(unsupported, "Resize of a non-float tensor")
+        var dims: i64[8]
+        for axis in 0..<x.rank:
+            dims[axis] = x.dims[axis]
+        var scales: f64[8]
+        for axis in 0..<x.rank:
+            scales[axis] = 1.0
+        if let sizes = self.input(node, 3):
+            if sizes.elements() != x.rank:
+                error(invalid, "Resize's sizes do not fit the tensor")
+            for axis in 0..<x.rank:
+                dims[axis] = sizes.ints[axis]
+                scales[axis] = (f64)dims[axis] / (f64)x.dims[axis] if x.dims[axis] > 0 else 1.0
+        elif let given = self.input(node, 2):
+            if given.elements() != x.rank:
+                error(invalid, "Resize's scales do not fit the tensor")
+            for axis in 0..<x.rank:
+                scales[axis] = (f64)given.floats[axis]
+                dims[axis] = (i64)math.floor((f64)x.dims[axis] * scales[axis])
+        else:
+            error(invalid, "Resize has neither scales nor sizes")
+        if x.rank < 2:
+            error(unsupported, "Resize of a tensor under two dimensions")
+        for axis in 0..<x.rank - 2:
+            if dims[axis] != x.dims[axis]:
+                error(unsupported, "Resize of an axis other than the last two")
+        let mode = self.text_attribute(node, "mode", "nearest")
+        let transform = self.text_attribute(node, "coordinate_transformation_mode", "half_pixel")
+        let nearest = self.text_attribute(node, "nearest_mode", "round_prefer_floor")
+        let a = (f64)self.float_attribute(node, "cubic_coeff_a", -0.75)
+        if self.int_attribute(node, "exclude_outside", 0) != 0:
+            error(unsupported, "Resize with exclude_outside")
+        let rows = x.rank - 2
+        let in_h = (usize)x.dims[rows]
+        let in_w = (usize)x.dims[rows + 1]
+        let out_h = (usize)dims[rows]
+        let out_w = (usize)dims[rows + 1]
+        let across = try taps_for(in_w, out_w, scales[rows + 1], mode, transform, nearest, a)
+        defer free(across) in memory.heap
+        let down = try taps_for(in_h, out_h, scales[rows], mode, transform, nearest, a)
+        defer free(down) in memory.heap
+        var out = try Tensor.float32(dims[..<x.rank])
+        errdefer out.release()
+        let planes = x.elements() // (in_h * in_w) if in_h * in_w > 0 else 0
+        var middle = try new f32[in_h * out_w] --- in memory.heap
+        defer free(middle) in memory.heap
+        for p in 0..<planes:
+            let source = x.floats[p * in_h * in_w..<(p + 1) * in_h * in_w]
+            # Across: each input row to out_w.
+            for y in 0..<in_h:
+                let line = source[y * in_w..<(y + 1) * in_w]
+                for column in 0..<out_w:
+                    let tap = across[column]
+                    var sum: f32 = 0.0
+                    for t in 0..<tap.count:
+                        sum += tap.weights[t] * line[(usize)tap.first[t]]
+                    middle[y * out_w + column] = sum
+            # Down: each output row from the filtered rows.
+            let target = out.floats[p * out_h * out_w..<(p + 1) * out_h * out_w]
+            for y in 0..<out_h:
+                let tap = down[y]
+                let line = target[y * out_w..<(y + 1) * out_w]
+                for column in 0..<out_w:
+                    line[column] = 0.0
+                for t in 0..<tap.count:
+                    let weight = tap.weights[t]
+                    axpy(line, middle[(usize)tap.first[t] * out_w..<((usize)tap.first[t] + 1) * out_w], weight)
+        return out
+
+## The taps of every output index along an axis of `length` resized to `size`.
+func taps_for(length: usize, size: usize, scale: f64, mode: str, transform: str, nearest: str, a: f64) -> Taps[]!:
+    if length == 0:
+        error(invalid, "Resize of an empty axis")
+    let out = try new Taps[size] in memory.heap
+    errdefer free(out) in memory.heap
+    let last = (i64)length - 1
+    for index in 0..<size:
+        let at = (f64)index
+        # Where output index `index` lies in the input.
+        var x = 0.0
+        if transform == "align_corners":
+            x = at * (f64)(length - 1) / (f64)(size - 1) if size > 1 else 0.0
+        elif transform == "asymmetric":
+            x = at / scale
+        elif transform == "pytorch_half_pixel":
+            x = (at + 0.5) / scale - 0.5 if size > 1 else 0.0
+        elif transform == "half_pixel":
+            x = (at + 0.5) / scale - 0.5
+        else:
+            error(unsupported, "a Resize coordinate transformation luce-nn does not run")
+        var taps = Taps()
+        if mode == "nearest":
+            var pick = 0.0
+            if nearest == "floor":
+                pick = math.floor(x)
+            elif nearest == "ceil":
+                pick = math.ceil(x)
+            elif nearest == "round_prefer_ceil":
+                pick = math.floor(x + 0.5)
+            else:
+                pick = math.ceil(x - 0.5)
+            taps.first[0] = clamp_index((i64)pick, 0, last)
+            taps.weights[0] = 1.0
+            taps.count = 1
+        elif mode == "linear":
+            let clamped = math.clamp(x, 0.0, (f64)last)
+            let low = (i64)math.floor(clamped)
+            let high = low + 1 if low < last else low
+            let t = clamped - (f64)low
+            taps.first[0] = low
+            taps.weights[0] = (f32)(1.0 - t)
+            taps.first[1] = high
+            taps.weights[1] = (f32)t
+            taps.count = 2
+        elif mode == "cubic":
+            let base = math.floor(x)
+            let t = x - base
+            for k in 0..<(usize)4:
+                let offset = (f64)k - 1.0
+                taps.first[k] = clamp_index((i64)base + (i64)k - 1, 0, last)
+                taps.weights[k] = (f32)cubic(t - offset, a)
+            taps.count = 4
+        else:
+            error(unsupported, "a Resize mode luce-nn does not run")
+        out[index] = taps
+    return out
+
+## Keys' cubic convolution kernel at distance `d` with parameter `a`.
+func cubic(d: f64, a: f64) -> f64:
+    let x = math.abs(d)
+    if x <= 1.0:
+        return ((a + 2.0) * x - (a + 3.0)) * x * x + 1.0
+    if x < 2.0:
+        return ((a * x - 5.0 * a) * x + 8.0 * a) * x - 4.0 * a
+    return 0.0

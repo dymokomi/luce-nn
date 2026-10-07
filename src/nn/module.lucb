@@ -1,0 +1,180 @@
+#==============================================================================================
+#
+#   nn - Neural network inference: ONNX models run on every processor
+#
+#   DESCRIPTION:
+#       A Model is an ONNX file (the protobuf ModelProto that PyTorch, onnxruntime and the
+#       Hugging Face exports write) loaded once: its graph's nodes in the file's order (ONNX
+#       keeps them topologically sorted), its weights (initializers) as tensors, and the
+#       names of its inputs and outputs. `run` feeds the inputs, evaluates every node in
+#       order, and keeps the outputs; intermediate tensors are let go as soon as no later
+#       node reads them, so a run holds little more than the weights and a few activations.
+#
+#       Tensors are float32, int64 (shapes, indices) or bool, dense and row-major, up to
+#       eight dimensions. The operators are the standard ONNX ones of opset 13 and later
+#       that vision models use (ops lists them); a model using any other fails to load,
+#       naming it. Results follow onnxruntime's (tests/run.py holds every operator to it,
+#       and Depth Anything V2 as a whole).
+#
+#       Matrix products and convolutions run on every processor (gemm, parallel). The
+#       graph and the operators are the backend's caller, not its owner: a GPU backend
+#       (luce-gpu compute) can take nodes over without the loader changing.
+#
+#       Fragments, in ORDER:
+#
+#       module.lucb       error codes, Model's public face: load, inputs, run, outputs
+#       tensor.lucb       Tensor: element type, shape, owned data; broadcasting
+#       protobuf.lucb     the protobuf wire format, read from a byte view
+#       onnx.lucb         ModelProto, GraphProto, NodeProto, TensorProto into a Model
+#       names.lucb        names to value slots (an open-addressing table)
+#       graph.lucb        running the graph: inputs, node dispatch, freeing, outputs
+#       parallel.lucb     work items on every processor (until luce-std has one)
+#       gemm.lucb         C = A·B on float32, blocked and threaded
+#       elementwise.lucb  arithmetic with broadcasting, comparisons, Where, Erf and friends
+#       reduce.lucb       ReduceMean, Softmax
+#       layout.lucb       Shape, Reshape, Transpose, Concat, Gather, Slice, Expand, Squeeze
+#       conv.lucb         Conv and ConvTranspose (2D)
+#       resize.lucb       Resize: nearest, linear and cubic on the last two axes
+#       tests.lucb        tests on hand-built graphs
+#
+#==============================================================================================
+
+import c
+import interop
+import memory
+import os
+import strings
+import thread
+import time
+from luce_std import files
+from luce_std import math
+from luce_std import math32
+from luce_std.collections import List
+
+## The file is not an ONNX model, or is damaged.
+pub let malformed: ErrorCode = ErrorCode.package(1)
+## The model uses an operator, an element type or an attribute this package does not run.
+pub let unsupported: ErrorCode = ErrorCode.package(2)
+## An input or a run's shapes do not fit the graph.
+pub let invalid: ErrorCode = ErrorCode.package(3)
+
+## A loaded ONNX model: its graph, weights and the values of the last run.
+pub struct Model:
+    ## The file's bytes, owned: names and attribute texts are views of them.
+    var file: u8[]
+    ## Every named value: the weights (constant), the inputs, and what nodes make.
+    var values: List[Tensor]
+    var constant: List[bool]
+    var value_names: List[str]
+    var names: Names
+    var nodes: List[Node]
+    ## Node inputs and outputs (value slots, -1 for an omitted optional input),
+    ## attributes, and the integer and float lists attributes carry.
+    var edges: List[i64]
+    var attributes: List[Attribute]
+    var ints: List[i64]
+    var floats: List[f32]
+    ## The graph's runtime inputs and its outputs, as value slots.
+    var inputs: List[i64]
+    var outputs: List[i64]
+    ## Per value: the last node reading it (-1 none), so it can be let go after.
+    var last_use: List[i64]
+    ## The name of the node a failed run stopped at.
+    pub var failed_node: str
+    ## Nanoseconds the last run spent in each operator (by Op), when `profiling`.
+    pub var profiling: bool
+    var spent: u64[32]
+
+    ## The model in the ONNX file at `path`.
+    pub static func open(path: str) -> Model!:
+        let terminated = try strings.copy(path)
+        defer strings.release(terminated)
+        let read = try files.read((c.str)terminated)
+        defer read.release()
+        return try Model.load(read.value)
+
+    ## The model in `data` (an ONNX file's bytes, copied).
+    pub static func load(data: const u8[]) -> Model!:
+        var model: Model
+        errdefer model.close()
+        model.file = try new u8[data.length] --- in memory.heap
+        memory.copy(model.file, data, data.length)
+        try model.parse()
+        try model.plan()
+        return model
+
+    ## How many runtime inputs the graph takes, and the name of each.
+    pub func input_count() -> usize:
+        return self.inputs.length()
+
+    pub func input_name(at: usize) -> str:
+        return self.value_names.at((usize)self.inputs.at(at))
+
+    ## How many nodes the graph has, and how many values (weights, inputs and what
+    ## nodes make).
+    pub func node_count() -> usize:
+        return self.nodes.length()
+
+    pub func value_count() -> usize:
+        return self.values.length()
+
+    pub func output_count() -> usize:
+        return self.outputs.length()
+
+    pub func output_name(at: usize) -> str:
+        return self.value_names.at((usize)self.outputs.at(at))
+
+    ## Give input `name` the float32 tensor of shape `dims` holding `data` (copied).
+    pub func set_input(name: str, dims: const i64[], data: const f32[]) -> !:
+        let slot = self.input_slot(name) else error(invalid, "the model has no such input")
+        var tensor = try Tensor.float32(dims)
+        errdefer tensor.release()
+        if tensor.elements() != data.length:
+            error(invalid, "an input's data does not fill its shape")
+        memory.copy(tensor.floats, data, data.length)
+        self.values.items()[(usize)slot].release()
+        self.values.set((usize)slot, tensor)
+
+    ## Run the graph on the inputs set; the outputs stay until the next run.
+    pub func run() -> !:
+        try self.evaluate()
+
+    ## The nanoseconds the last profiled run spent in the operator named `op`
+    ## ("MatMul", "Conv"...); 0 for one it did not run.
+    pub func time_in(op: str) -> u64:
+        let found = op_named(op) else return 0
+        return self.spent[(usize)found]
+
+    ## Output `name` of the last run, or none.
+    pub func output(name: str) -> const Tensor*?:
+        for slot in self.outputs.view():
+            if self.value_names.at((usize)slot) == name:
+                let found = &self.values.items()[(usize)slot]
+                return found if found.present else none
+        return none
+
+    pub func close():
+        for at in 0..<self.values.length():
+            self.values.items()[at].release()
+        self.values.destroy()
+        self.constant.destroy()
+        self.value_names.destroy()
+        self.names.destroy()
+        self.nodes.destroy()
+        self.edges.destroy()
+        self.attributes.destroy()
+        self.ints.destroy()
+        self.floats.destroy()
+        self.inputs.destroy()
+        self.outputs.destroy()
+        self.last_use.destroy()
+        if self.file.length > 0:
+            free(self.file) in memory.heap
+        var none_bytes: u8[]
+        self.file = none_bytes
+
+    func input_slot(name: str) -> i64?:
+        for slot in self.inputs.view():
+            if self.value_names.at((usize)slot) == name:
+                return slot
+        return none

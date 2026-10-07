@@ -1,0 +1,83 @@
+## The loops luce-nn's speed depends on, on one core, for the SIMD vectorizer's work
+## (LUCE_LANG, 2026-10-06). Each prints its rate in G elements per second:
+##
+##   axpy, plain       c[i] += w·b[i]; b's length is not proven to cover c's.
+##   axpy, cut         the same with b cut to c's length first (vectorizes today).
+##   gemm 4×N          the register-blocked micro-kernel: four rows of C updated per
+##                     loaded row of B (four stores per loop; scalar today).
+##   dot               a float sum of products (a float reduction; scalar today).
+##
+## Results are printed so the work is not optimized away.
+import memory
+import time
+
+let width: usize = 256
+let rounds: usize = 2000000
+
+func axpy_plain(target: f32[], source: const f32[], weight: f32):
+    let length = target.length
+    for at in 0..<length:
+        target[at] = target[at] + weight * source[at]
+
+func axpy_cut(target: f32[], source: const f32[], weight: f32):
+    let length = target.length
+    let run = source[..<length]
+    for at in 0..<length:
+        target[at] = target[at] + weight * run[at]
+
+## Four rows of C gain a·B's row: the shape a GEMM micro-kernel wants, one load of
+## b[at] feeding four multiply-adds.
+func gemm_4xn(c0: f32[], c1: f32[], c2: f32[], c3: f32[], b: const f32[], a0: f32, a1: f32, a2: f32, a3: f32):
+    let length = c0.length
+    let r1 = c1[..<length]
+    let r2 = c2[..<length]
+    let r3 = c3[..<length]
+    let run = b[..<length]
+    for at in 0..<length:
+        let value = run[at]
+        c0[at] = c0[at] + a0 * value
+        r1[at] = r1[at] + a1 * value
+        r2[at] = r2[at] + a2 * value
+        r3[at] = r3[at] + a3 * value
+
+func dot(a: const f32[], b: const f32[]) -> f32:
+    let length = a.length
+    let run = b[..<length]
+    var sum: f32 = 0.0
+    for at in 0..<length:
+        sum = sum + a[at] * run[at]
+    return sum
+
+func rate(started: u64, elements: usize) -> f64:
+    return (f64)elements / ((f64)(time.now() - started) / 1.0e9) / 1.0e9
+
+pub func main(arguments: str[]) -> i32!:
+    let rows = try new f32[width * 4] in memory.heap
+    defer free(rows) in memory.heap
+    let source = try new f32[width] in memory.heap
+    defer free(source) in memory.heap
+    for at in 0..<width:
+        source[at] = (f32)at * 0.001
+    let c0 = rows[0..<width]
+    let c1 = rows[width..<width * 2]
+    let c2 = rows[width * 2..<width * 3]
+    let c3 = rows[width * 3..<width * 4]
+    var started = time.now()
+    for _ in 0..<rounds:
+        axpy_plain(c0, source, 0.5)
+    print(f"axpy, plain  {rate(started, rounds * width)} G elements/s")
+    started = time.now()
+    for _ in 0..<rounds:
+        axpy_cut(c0, source, 0.5)
+    print(f"axpy, cut    {rate(started, rounds * width)} G elements/s")
+    started = time.now()
+    for _ in 0..<rounds // 4:
+        gemm_4xn(c0, c1, c2, c3, source, 0.5, 0.25, 0.125, 0.0625)
+    print(f"gemm 4×N     {rate(started, rounds * width)} G multiply-adds/s")
+    started = time.now()
+    var total: f32 = 0.0
+    for _ in 0..<rounds:
+        total = total + dot(c0, source)
+    print(f"dot          {rate(started, rounds * width)} G elements/s")
+    print(f"(checks: {c0[7]} {c3[9]} {total})")
+    return 0

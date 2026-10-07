@@ -1,0 +1,103 @@
+#==============================================================================================
+#
+#   nn/protobuf - The protobuf wire format, read from a byte view
+#
+#   DESCRIPTION:
+#       A message is a run of fields, each a key (field number << 3 | wire type) and a
+#       value: a varint (0), 64 bits (1), a length and that many bytes (2: strings, bytes,
+#       nested messages and packed repeated scalars) or 32 bits (5). Wire reads a message
+#       field by field; every length is checked against the bytes left.
+#
+#==============================================================================================
+
+let wire_varint: u64 = 0
+let wire_fixed64: u64 = 1
+let wire_bytes: u64 = 2
+let wire_fixed32: u64 = 5
+
+struct Wire:
+    var data: const u8[]
+    var at: usize
+
+    func done() -> bool:
+        return self.at >= self.data.length
+
+    func varint() -> u64!:
+        var value: u64 = 0
+        var shift: u64 = 0
+        while true:
+            if self.at >= self.data.length or shift > 63:
+                error(malformed, "a protobuf varint runs past its message")
+            let byte = self.data[self.at]
+            self.at += 1
+            value |= ((u64)(byte & 127)) << shift
+            if byte < 128:
+                return value
+            shift += 7
+        return value
+
+    ## The next field's number and wire type.
+    func key() -> (u64, u64)!:
+        let key = try self.varint()
+        return (key >> 3, key & 7)
+
+    ## A length-delimited value.
+    func bytes() -> const u8[]!:
+        let length = try self.varint()
+        if length > (u64)(self.data.length - self.at):
+            error(malformed, "a protobuf field runs past its message")
+        let start = self.at
+        self.at += (usize)length
+        return self.data[start..<self.at]
+
+    func fixed32() -> u32!:
+        if self.data.length - self.at < 4:
+            error(malformed, "a protobuf field runs past its message")
+        let value = (u32)self.data[self.at] | ((u32)self.data[self.at + 1] << 8) | ((u32)self.data[self.at + 2] << 16) | ((u32)self.data[self.at + 3] << 24)
+        self.at += 4
+        return value
+
+    func fixed64() -> u64!:
+        let low = (u64)(try self.fixed32())
+        let high = (u64)(try self.fixed32())
+        return low | (high << 32)
+
+    ## Pass over a value of wire type `kind`.
+    func skip(kind: u64) -> !:
+        if kind == wire_varint:
+            _ = try self.varint()
+        elif kind == wire_fixed64:
+            _ = try self.fixed64()
+        elif kind == wire_bytes:
+            _ = try self.bytes()
+        elif kind == wire_fixed32:
+            _ = try self.fixed32()
+        else:
+            error(malformed, "a protobuf field has an unknown wire type")
+
+## A float32 from its bits.
+func float_of_bits(bits: u32) -> f32:
+    var value = bits
+    return *(f32*)&value
+
+## A signed int64 from a varint's bits (two's complement, as protobuf's int64 is).
+func signed(value: u64) -> i64:
+    return (i64)value
+
+## Append the int64s of a repeated field (packed, or one per field) to `into`.
+func read_ints(wire: Wire*, kind: u64, into: List[i64]*) -> !:
+    if kind == wire_bytes:
+        var packed = Wire(data = try wire.bytes())
+        while not packed.done():
+            try into.append(signed(try packed.varint()))
+    else:
+        try into.append(signed(try wire.varint()))
+
+## Append the floats of a repeated float field (packed, or one per field) to `into`.
+func read_floats(wire: Wire*, kind: u64, into: List[f32]*) -> !:
+    if kind == wire_bytes:
+        var packed = Wire(data = try wire.bytes())
+        while not packed.done():
+            try into.append(float_of_bits(try packed.fixed32()))
+    else:
+        try into.append(float_of_bits(try wire.fixed32()))

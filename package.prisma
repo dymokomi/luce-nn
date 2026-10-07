@@ -1,0 +1,15 @@
+#prisma 4.0
+def package "luce-nn" {
+    str owner = "dymokomi"
+    str version = "0.1.0"
+    str kind = "package"
+    str language = "luce-base"
+    str description = "Neural network inference for Luce/Base: loads ONNX models (protobuf, opset 13+) and runs their graphs on every processor, checked against onnxruntime; Depth Anything and other vision models."
+    str readme = "README.md"
+    str[] public = ["nn"]
+
+    def dependency "luce-std" {
+        str owner = "dymokomi"
+        str path = "../luce-std"
+    }
+}

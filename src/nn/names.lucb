@@ -1,0 +1,76 @@
+#==============================================================================================
+#
+#   nn/names - Value names to slots: an open-addressing table on FNV-1a hashes
+#
+#   DESCRIPTION:
+#       A large model names a few thousand values; the loader looks each node's inputs
+#       up as it reads them. The table keeps the names (views of the model's file) and
+#       their slots, at most half full, doubling when it fills.
+#
+#==============================================================================================
+
+struct Names:
+    var keys: str[]
+    var slots: i64[]
+    var used: usize
+
+    func find(name: str) -> i64?:
+        if self.keys.length == 0:
+            return none
+        let mask = self.keys.length - 1
+        var at = (usize)hash(name) & mask
+        while self.slots[at] >= 0:
+            if self.keys[at] == name:
+                return self.slots[at]
+            at = (at + 1) & mask
+        return none
+
+    func insert(name: str, slot: i64) -> !:
+        if (self.used + 1) * 2 > self.keys.length:
+            try self.grow()
+        let mask = self.keys.length - 1
+        var at = (usize)hash(name) & mask
+        while self.slots[at] >= 0:
+            if self.keys[at] == name:
+                self.slots[at] = slot
+                return
+            at = (at + 1) & mask
+        self.keys[at] = name
+        self.slots[at] = slot
+        self.used += 1
+
+    func grow() -> !:
+        let size = self.keys.length * 2 if self.keys.length > 0 else 64
+        let keys = try new str[size] in memory.heap
+        errdefer free(keys) in memory.heap
+        let slots = try new i64[size] --- in memory.heap
+        for at in 0..<size:
+            slots[at] = -1
+        let old_keys = self.keys
+        let old_slots = self.slots
+        self.keys = keys
+        self.slots = slots
+        self.used = 0
+        for at in 0..<old_keys.length:
+            if old_slots[at] >= 0:
+                try self.insert(old_keys[at], old_slots[at])
+        if old_keys.length > 0:
+            free(old_keys) in memory.heap
+            free(old_slots) in memory.heap
+
+    func destroy():
+        if self.keys.length > 0:
+            free(self.keys) in memory.heap
+            free(self.slots) in memory.heap
+        var no_keys: str[]
+        var no_slots: i64[]
+        self.keys = no_keys
+        self.slots = no_slots
+        self.used = 0
+
+## FNV-1a over `name`'s bytes.
+func hash(name: str) -> u64:
+    var value: u64 = 14695981039346656037
+    for byte in name.bytes:
+        value = (value ^ (u64)byte) *% 1099511628211
+    return value

@@ -1,0 +1,134 @@
+#==============================================================================================
+#
+#   nn/reduce - ReduceMean and Softmax
+#
+#   DESCRIPTION:
+#       Both work along axes of a row-major tensor seen as outer × axis × inner. The
+#       last axis (layer norms, attention) is the common case: contiguous rows. Sums
+#       are kept in float64.
+#
+#==============================================================================================
+
+## The mean over `axes` (all when none are given), keeping them as 1s when `keep`.
+func reduce_mean(x: const Tensor*, axes: Axes, keep: bool) -> Tensor!:
+    if x.dtype != DType.float32:
+        error(unsupported, "ReduceMean on a non-float tensor")
+    var dims: i64[8]
+    var rank: usize = 0
+    for axis in 0..<x.rank:
+        let reduced = axes.none_given or axes.holds(axis, x.rank)
+        if not reduced:
+            dims[rank] = x.dims[axis]
+            rank += 1
+        elif keep:
+            dims[rank] = 1
+            rank += 1
+    var out = try Tensor.float32(dims[..<rank])
+    errdefer out.release()
+    let total = x.elements()
+    let kept = out.elements()
+    if kept == 0 or total == 0:
+        return out
+    let group = total // kept
+    # Reducing a trailing run of axes: each output element is one contiguous run.
+    if trailing(axes, x.rank):
+        for row in 0..<kept:
+            let values = x.floats[row * group..<row * group + group]
+            var sum = 0.0
+            for value in values:
+                sum += (f64)value
+            out.floats[row] = (f32)(sum / (f64)group)
+        return out
+    # Any other axes: add every element into its output.
+    var sums = try new f64[kept] in memory.heap
+    defer free(sums) in memory.heap
+    var out_strides: i64[8]
+    var keep_dims: i64[8]
+    for axis in 0..<x.rank:
+        keep_dims[axis] = 1 if axes.none_given or axes.holds(axis, x.rank) else x.dims[axis]
+    strides_of(keep_dims[..<x.rank], out_strides)
+    var index: i64[8]
+    for at in 0..<total:
+        var target: i64 = 0
+        for axis in 0..<x.rank:
+            if keep_dims[axis] != 1:
+                target += index[axis] * out_strides[axis]
+        sums[(usize)target] += (f64)x.floats[at]
+        var axis = x.rank
+        while axis > 0:
+            axis -= 1
+            index[axis] += 1
+            if index[axis] < x.dims[axis]:
+                break
+            index[axis] = 0
+    for at in 0..<kept:
+        out.floats[at] = (f32)(sums[at] / (f64)group)
+    return out
+
+## Whether `axes` are exactly the last few of a tensor of rank `rank`.
+func trailing(axes: Axes, rank: usize) -> bool:
+    if axes.none_given:
+        return true
+    var first = rank
+    for axis in 0..<rank:
+        if axes.holds(axis, rank) and axis < first:
+            first = axis
+    for axis in first..<rank:
+        if not axes.holds(axis, rank):
+            return false
+    return true
+
+## Softmax along `axis` (opset 13: that axis alone).
+func softmax(x: const Tensor*, axis_given: i64) -> Tensor!:
+    if x.dtype != DType.float32:
+        error(unsupported, "Softmax on a non-float tensor")
+    let axis = (usize)(axis_given + (i64)x.rank if axis_given < 0 else axis_given)
+    if axis >= x.rank:
+        error(invalid, "Softmax's axis is outside the tensor")
+    var out = try Tensor.float32(x.shape())
+    errdefer out.release()
+    let length = (usize)x.dims[axis]
+    var inner: usize = 1
+    for after in axis + 1..<x.rank:
+        inner *= (usize)x.dims[after]
+    let outer = x.elements() // (length * inner) if length * inner > 0 else 0
+    var job = Softmax(x = x.floats, y = out.floats, length = length, inner = inner, groups = outer * inner)
+    let items = (job.groups + softmax_groups - 1) // softmax_groups
+    if x.elements() < 65536:
+        for item in 0..<items:
+            try softmax_item((void*)&job, item)
+    else:
+        try parallel(items, (void*)&job, softmax_item)
+    return out
+
+## Groups (one softmax each) per work item.
+let softmax_groups: usize = 64
+
+struct Softmax:
+    var x: const f32[]
+    var y: f32[]
+    var length: usize
+    var inner: usize
+    var groups: usize
+
+func softmax_item(context: void*, item: usize) -> !:
+    let job = (Softmax*)context
+    let end = (item + 1) * softmax_groups if (item + 1) * softmax_groups < job.groups else job.groups
+    for group in item * softmax_groups..<end:
+        let o = group // job.inner
+        let i = group % job.inner
+        let base = o * job.length * job.inner + i
+        let length = job.length
+        let inner = job.inner
+        var largest = job.x[base]
+        for at in 1..<length:
+            let value = job.x[base + at * inner]
+            largest = value if value > largest else largest
+        var sum = 0.0
+        for at in 0..<length:
+            let e = math32.exp(job.x[base + at * inner] - largest)
+            job.y[base + at * inner] = e
+            sum += (f64)e
+        let scale = (f32)(1.0 / sum)
+        for at in 0..<length:
+            job.y[base + at * inner] *= scale

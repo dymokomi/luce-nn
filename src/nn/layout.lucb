@@ -1,0 +1,285 @@
+#==============================================================================================
+#
+#   nn/layout - Operators that move elements without arithmetic
+#
+#   DESCRIPTION:
+#       Shape, Reshape, Unsqueeze and Squeeze change only the shape (the data is copied:
+#       every value owns its data). Transpose, Concat, Gather, Slice and Expand gather
+#       elements by index; their inner loops copy contiguous runs where the layout has
+#       them.
+#
+#==============================================================================================
+
+## A tensor's shape as a 1-D int64 tensor.
+func shape_of(x: const Tensor*) -> Tensor!:
+    var dims: i64[1] = [(i64)x.rank]
+    var out = try Tensor.int64(dims)
+    for axis in 0..<x.rank:
+        out.ints[axis] = x.dims[axis]
+    return out
+
+## `x` with the same data and shape `dims` (copied).
+func reshaped(x: const Tensor*, dims: const i64[]) -> Tensor!:
+    var out = try Tensor.of(x.dtype, dims)
+    errdefer out.release()
+    if out.elements() != x.elements():
+        error(invalid, "a reshape changes the number of elements")
+    if x.dtype == DType.float32:
+        memory.copy(out.floats, x.floats, x.floats.length)
+    else:
+        memory.copy(out.ints, x.ints, x.ints.length)
+    return out
+
+## Reshape: 0 keeps the input's dimension (unless `allow_zero`), -1 takes what is left.
+func reshape(x: const Tensor*, shape: const Tensor*, allow_zero: bool) -> Tensor!:
+    let rank = shape.elements()
+    if rank > most_dims:
+        error(unsupported, "a reshape to more than eight dimensions")
+    var dims: i64[8]
+    var unknown: i64 = -1
+    var known: i64 = 1
+    for axis in 0..<rank:
+        var dim = shape.ints[axis]
+        if dim == 0 and not allow_zero:
+            dim = x.dims[axis] if axis < x.rank else 0
+        if dim == -1:
+            if unknown >= 0:
+                error(invalid, "a reshape with two unknown dimensions")
+            unknown = (i64)axis
+        else:
+            known *= dim
+        dims[axis] = dim
+    if unknown >= 0:
+        dims[(usize)unknown] = (i64)x.elements() // known if known > 0 else 0
+    return try reshaped(x, dims[..<rank])
+
+## Unsqueeze: a dimension of 1 inserted at each of `axes` (of the output).
+func unsqueeze(x: const Tensor*, axes: Axes) -> Tensor!:
+    let rank = x.rank + axes.count
+    if rank > most_dims:
+        error(unsupported, "an unsqueeze past eight dimensions")
+    var dims: i64[8]
+    var from_axis: usize = 0
+    for axis in 0..<rank:
+        if axes.holds(axis, rank):
+            dims[axis] = 1
+        else:
+            dims[axis] = x.dims[from_axis]
+            from_axis += 1
+    return try reshaped(x, dims[..<rank])
+
+## Squeeze: the dimensions of 1 at `axes` (all of them when none are given) dropped.
+func squeeze(x: const Tensor*, axes: Axes) -> Tensor!:
+    var dims: i64[8]
+    var rank: usize = 0
+    for axis in 0..<x.rank:
+        let dropped = x.dims[axis] == 1 and (axes.none_given or axes.holds(axis, x.rank))
+        if not dropped:
+            dims[rank] = x.dims[axis]
+            rank += 1
+    return try reshaped(x, dims[..<rank])
+
+## Transpose: output axis `i` is input axis `perm[i]` (reversed when no perm is given).
+func transpose(x: const Tensor*, given: const i64[]?) -> Tensor!:
+    var perm: i64[8]
+    for axis in 0..<x.rank:
+        perm[axis] = (i64)(x.rank - 1 - axis)
+    if let listed = given:
+        if listed.length != x.rank:
+            error(invalid, "Transpose's perm does not fit the tensor")
+        for axis in 0..<x.rank:
+            perm[axis] = listed[axis]
+    var dims: i64[8]
+    var in_strides: i64[8]
+    strides_of(x.shape(), in_strides)
+    var steps: i64[8]
+    for axis in 0..<x.rank:
+        dims[axis] = x.dims[(usize)perm[axis]]
+        steps[axis] = in_strides[(usize)perm[axis]]
+    var out = try Tensor.of(x.dtype, dims[..<x.rank])
+    errdefer out.release()
+    var walk = Walk.over(dims, x.rank)
+    walk.stepping(0, steps[..<x.rank])
+    let length = walk.row_length
+    let step = walk.step(0)
+    for row in 0..<walk.rows:
+        let at = row * length
+        let first = walk.offsets[0]
+        if x.dtype == DType.float32:
+            gather_row(out.floats[at..<at + length], x.floats, first, step)
+        else:
+            for column in 0..<length:
+                out.ints[at + column] = x.ints[(usize)(first + step * (i64)column)]
+        walk.next()
+    return out
+
+## out[i] = x[first + i·step].
+func gather_row(out: f32[], x: const f32[], first: i64, step: i64):
+    if step == 1:
+        memory.copy(out, x[(usize)first..<(usize)first + out.length], out.length)
+        return
+    for column in 0..<out.length:
+        out[column] = x[(usize)(first + step * (i64)column)]
+
+## Concat along `axis_given`.
+func concat(parts: const (const Tensor*)[], axis_given: i64) -> Tensor!:
+    if parts.length == 0:
+        error(invalid, "Concat of nothing")
+    let first = parts[0]
+    let axis = (usize)(axis_given + (i64)first.rank if axis_given < 0 else axis_given)
+    var dims: i64[8]
+    for d in 0..<first.rank:
+        dims[d] = first.dims[d]
+    dims[axis] = 0
+    for part in parts:
+        if part.rank != first.rank or part.dtype != first.dtype:
+            error(invalid, "Concat's parts differ in rank or element type")
+        dims[axis] += part.dims[axis]
+    var out = try Tensor.of(first.dtype, dims[..<first.rank])
+    errdefer out.release()
+    var outer: usize = 1
+    for d in 0..<axis:
+        outer *= (usize)dims[d]
+    var inner: usize = 1
+    for d in axis + 1..<first.rank:
+        inner *= (usize)dims[d]
+    let out_run = (usize)dims[axis] * inner
+    var offset: usize = 0
+    for part in parts:
+        let run = (usize)part.dims[axis] * inner
+        for o in 0..<outer:
+            if out.dtype == DType.float32:
+                memory.copy(out.floats[o * out_run + offset..<o * out_run + offset + run], part.floats[o * run..<o * run + run], run)
+            else:
+                memory.copy(out.ints[o * out_run + offset..<o * out_run + offset + run], part.ints[o * run..<o * run + run], run)
+        offset += run
+    return out
+
+## Gather along `axis_given` at `indices` (negative counting from the end).
+func gather(x: const Tensor*, indices: const Tensor*, axis_given: i64) -> Tensor!:
+    let axis = (usize)(axis_given + (i64)x.rank if axis_given < 0 else axis_given)
+    if axis >= x.rank:
+        error(invalid, "Gather's axis is outside the tensor")
+    var dims: i64[8]
+    var rank: usize = 0
+    for d in 0..<axis:
+        dims[rank] = x.dims[d]
+        rank += 1
+    for d in 0..<indices.rank:
+        dims[rank] = indices.dims[d]
+        rank += 1
+    for d in axis + 1..<x.rank:
+        dims[rank] = x.dims[d]
+        rank += 1
+    if rank > most_dims:
+        error(unsupported, "a gather past eight dimensions")
+    var out = try Tensor.of(x.dtype, dims[..<rank])
+    errdefer out.release()
+    var outer: usize = 1
+    for d in 0..<axis:
+        outer *= (usize)x.dims[d]
+    var inner: usize = 1
+    for d in axis + 1..<x.rank:
+        inner *= (usize)x.dims[d]
+    let length = x.dims[axis]
+    let picks = indices.elements()
+    for o in 0..<outer:
+        for p in 0..<picks:
+            var index = indices.int_at(p)
+            index = index + length if index < 0 else index
+            if index < 0 or index >= length:
+                error(invalid, "a Gather index is outside the axis")
+            let source = (o * (usize)length + (usize)index) * inner
+            let target = (o * picks + p) * inner
+            if x.dtype == DType.float32:
+                memory.copy(out.floats[target..<target + inner], x.floats[source..<source + inner], inner)
+            else:
+                memory.copy(out.ints[target..<target + inner], x.ints[source..<source + inner], inner)
+    return out
+
+## Slice: per axis listed, starts..ends by steps (clamped as ONNX does).
+func slice(x: const Tensor*, starts: const Tensor*, ends: const Tensor*, axes_given: const Tensor*?, steps_given: const Tensor*?) -> Tensor!:
+    var first: i64[8]
+    var step: i64[8]
+    var dims: i64[8]
+    for axis in 0..<x.rank:
+        first[axis] = 0
+        step[axis] = 1
+        dims[axis] = x.dims[axis]
+    for at in 0..<starts.elements():
+        var axis = at
+        if let listed = axes_given:
+            let value = listed.int_at(at)
+            axis = (usize)(value + (i64)x.rank if value < 0 else value)
+        if axis >= x.rank:
+            error(invalid, "a Slice axis is outside the tensor")
+        let dim = x.dims[axis]
+        var by: i64 = 1
+        if let given = steps_given:
+            by = given.int_at(at)
+        if by == 0:
+            error(invalid, "a Slice step of zero")
+        var begin = starts.int_at(at)
+        var end = ends.int_at(at)
+        begin = begin + dim if begin < 0 else begin
+        end = end + dim if end < 0 else end
+        if by > 0:
+            begin = clamp_index(begin, 0, dim)
+            end = clamp_index(end, 0, dim)
+            dims[axis] = (end - begin + by - 1) // by if end > begin else 0
+        else:
+            begin = clamp_index(begin, 0, dim - 1)
+            end = clamp_index(end, -1, dim - 1)
+            dims[axis] = (begin - end - by - 1) // (-by) if begin > end else 0
+        first[axis] = begin
+        step[axis] = by
+    var out = try Tensor.of(x.dtype, dims[..<x.rank])
+    errdefer out.release()
+    var in_strides: i64[8]
+    strides_of(x.shape(), in_strides)
+    var steps: i64[8]
+    var start: i64 = 0
+    for axis in 0..<x.rank:
+        steps[axis] = in_strides[axis] * step[axis]
+        start += first[axis] * in_strides[axis]
+    var walk = Walk.over(dims, x.rank)
+    walk.stepping(0, steps[..<x.rank])
+    walk.offsets[0] = start
+    let length = walk.row_length
+    for row in 0..<walk.rows:
+        let at = row * length
+        if x.dtype == DType.float32:
+            gather_row(out.floats[at..<at + length], x.floats, walk.offsets[0], walk.step(0))
+        else:
+            for column in 0..<length:
+                out.ints[at + column] = x.ints[(usize)(walk.offsets[0] + walk.step(0) * (i64)column)]
+        walk.next()
+    return out
+
+func clamp_index(value: i64, low: i64, high: i64) -> i64:
+    return low if value < low else (high if value > high else value)
+
+## Expand: `x` broadcast to `shape` (and `shape` to `x`, as numpy's broadcast).
+func expand(x: const Tensor*, shape: const Tensor*) -> Tensor!:
+    var wanted: i64[8]
+    let count = shape.elements()
+    if count > most_dims:
+        error(unsupported, "an expand past eight dimensions")
+    for at in 0..<count:
+        wanted[at] = shape.ints[at]
+    var dims: i64[8]
+    let rank = try broadcast(x.shape(), wanted[..<count], dims)
+    var out = try Tensor.of(x.dtype, dims[..<rank])
+    errdefer out.release()
+    var walk = Walk.over(dims, rank)
+    walk.broadcasting(0, x.shape())
+    let length = walk.row_length
+    for row in 0..<walk.rows:
+        let at = row * length
+        if x.dtype == DType.float32:
+            gather_row(out.floats[at..<at + length], x.floats, walk.offsets[0], walk.step(0))
+        else:
+            for column in 0..<length:
+                out.ints[at + column] = x.ints[(usize)(walk.offsets[0] + walk.step(0) * (i64)column)]
+        walk.next()
+    return out

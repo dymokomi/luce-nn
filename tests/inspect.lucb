@@ -1,0 +1,18 @@
+## Load the ONNX model named on the command line and print its inputs, outputs, node
+## and value counts, and how long loading took.
+import time
+from luce_nn import nn
+
+pub func main(arguments: str[]) -> i32!:
+    if arguments.length < 2:
+        print("usage: inspect MODEL.onnx")
+        return 2
+    let started = time.now()
+    var model = try nn.Model.open(arguments[1])
+    defer model.close()
+    print(f"loaded in {(time.now() - started) // 1000000} ms: {model.node_count()} nodes, {model.value_count()} values")
+    for at in 0..<model.input_count():
+        print(f"input  {model.input_name(at)}")
+    for at in 0..<model.output_count():
+        print(f"output {model.output_name(at)}")
+    return 0

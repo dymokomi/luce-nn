@@ -1,0 +1,169 @@
+#==============================================================================================
+#
+#   nn/graph - Running the graph: node by node, letting values go after their last use
+#
+#==============================================================================================
+
+extend Model:
+    ## Each value's last reader, so `evaluate` lets it go after that node. Weights,
+    ## inputs and outputs are kept.
+    func plan() -> !:
+        for (index, node) in self.nodes.view().indexed():
+            for edge in self.edges.view()[node.first_input..<node.first_input + node.input_count]:
+                if edge >= 0:
+                    self.last_use.set((usize)edge, (i64)index)
+        for slot in self.outputs.view():
+            self.last_use.set((usize)slot, -1)
+        for slot in self.inputs.view():
+            self.last_use.set((usize)slot, -1)
+
+    func evaluate() -> !:
+        for slot in self.inputs.view():
+            if not self.values.at((usize)slot).present:
+                error(invalid, "an input of the model was not set")
+        for at in 0..<(usize)32:
+            self.spent[at] = 0
+        for (index, node) in self.nodes.view().indexed():
+            let started = time.now() if self.profiling else 0
+            let made = self.compute(&node) catch failure:
+                self.failed_node = node.name
+                error(failure.code, failure.message)
+            if self.profiling:
+                self.spent[(usize)node.op] += time.now() - started
+            let out = self.edges.at(node.first_output)
+            if out >= 0:
+                self.values.items()[(usize)out].release()
+                self.values.set((usize)out, made)
+            else:
+                var dropped = made
+                dropped.release()
+            # Values no later node reads are let go.
+            for edge in self.edges.view()[node.first_input..<node.first_input + node.input_count]:
+                if edge >= 0 and self.last_use.at((usize)edge) == (i64)index and not self.constant.at((usize)edge):
+                    self.values.items()[(usize)edge].release()
+
+    ## Input `at` of `node`, or none when it is omitted or past the node's inputs.
+    func input(node: const Node*, at: usize) -> const Tensor*?:
+        if at >= node.input_count:
+            return none
+        let edge = self.edges.at(node.first_input + at)
+        if edge < 0:
+            return none
+        let found = &self.values.items()[(usize)edge]
+        return found if found.present else none
+
+    ## Input `at` of `node`, which must be there.
+    func needed(node: const Node*, at: usize) -> const Tensor*!:
+        return self.input(node, at) else error(invalid, "a node's input is missing")
+
+    func attribute(node: const Node*, name: str) -> const Attribute*?:
+        for at in node.first_attribute..<node.first_attribute + node.attribute_count:
+            let found = &self.attributes.items()[at]
+            if found.name == name:
+                return found
+        return none
+
+    func int_attribute(node: const Node*, name: str, fallback: i64) -> i64:
+        let found = self.attribute(node, name) else return fallback
+        return found.number
+
+    func float_attribute(node: const Node*, name: str, fallback: f32) -> f32:
+        let found = self.attribute(node, name) else return fallback
+        return found.real
+
+    func text_attribute(node: const Node*, name: str, fallback: str) -> str:
+        let found = self.attribute(node, name) else return fallback
+        return found.text
+
+    ## An ints attribute, or none.
+    func ints_attribute(node: const Node*, name: str) -> const i64[]?:
+        let found = self.attribute(node, name) else return none
+        if found.list != 1:
+            return none
+        return self.ints.view()[found.first..<found.first + found.length]
+
+    ## The operator of `node` on its inputs: its (first) output.
+    func compute(node: const Node*) -> Tensor!:
+        return match node.op:
+            .add => try binary(try self.needed(node, 0), try self.needed(node, 1), Arithmetic.add)
+            .sub => try binary(try self.needed(node, 0), try self.needed(node, 1), Arithmetic.sub)
+            .mul => try binary(try self.needed(node, 0), try self.needed(node, 1), Arithmetic.mul)
+            .div => try binary(try self.needed(node, 0), try self.needed(node, 1), Arithmetic.div)
+            .pow => try binary(try self.needed(node, 0), try self.needed(node, 1), Arithmetic.pow)
+            .equal => try binary(try self.needed(node, 0), try self.needed(node, 1), Arithmetic.equal)
+            .where_of => try where_of(try self.needed(node, 0), try self.needed(node, 1), try self.needed(node, 2))
+            .sqrt => try unary(try self.needed(node, 0), Unary.sqrt)
+            .relu => try unary(try self.needed(node, 0), Unary.relu)
+            .erf => try unary(try self.needed(node, 0), Unary.erf)
+            .sigmoid => try unary(try self.needed(node, 0), Unary.sigmoid)
+            .tanh_of => try unary(try self.needed(node, 0), Unary.tanh_of)
+            .exp_of => try unary(try self.needed(node, 0), Unary.exp_of)
+            .neg => try unary(try self.needed(node, 0), Unary.neg)
+            .identity => try (try self.needed(node, 0)).copy()
+            .matmul => try matmul(try self.needed(node, 0), try self.needed(node, 1))
+            .reduce_mean => try self.reduce_mean_node(node)
+            .softmax => try softmax(try self.needed(node, 0), self.int_attribute(node, "axis", -1))
+            .shape => try shape_of(try self.needed(node, 0))
+            .reshape => try reshape(try self.needed(node, 0), try self.needed(node, 1), self.int_attribute(node, "allowzero", 0) != 0)
+            .transpose => try transpose(try self.needed(node, 0), self.ints_attribute(node, "perm"))
+            .concat => try self.concat_node(node)
+            .gather => try gather(try self.needed(node, 0), try self.needed(node, 1), self.int_attribute(node, "axis", 0))
+            .slice => try slice(try self.needed(node, 0), try self.needed(node, 1), try self.needed(node, 2), self.input(node, 3), self.input(node, 4))
+            .unsqueeze => try unsqueeze(try self.needed(node, 0), self.axes_of(node, 1))
+            .squeeze => try squeeze(try self.needed(node, 0), self.axes_of(node, 1))
+            .expand => try expand(try self.needed(node, 0), try self.needed(node, 1))
+            .conv => try self.conv_node(node)
+            .conv_transpose => try self.conv_transpose_node(node)
+            .resize => try self.resize_node(node)
+            .constant => try self.constant_node(node)
+            _ => error(unsupported, "an operator luce-nn does not run")
+
+    ## A node's axes: from its input `at` (opset 13 and later) or its `axes` attribute.
+    func axes_of(node: const Node*, at: usize) -> Axes:
+        var out = Axes()
+        if let given = self.input(node, at):
+            for index in 0..<given.elements():
+                out.add(given.int_at(index))
+            return out
+        if let listed = self.ints_attribute(node, "axes"):
+            for value in listed:
+                out.add(value)
+            return out
+        out.none_given = true
+        return out
+
+    func reduce_mean_node(node: const Node*) -> Tensor!:
+        return try reduce_mean(try self.needed(node, 0), self.axes_of(node, 1), self.int_attribute(node, "keepdims", 1) != 0)
+
+    func concat_node(node: const Node*) -> Tensor!:
+        var parts: List[const Tensor*]
+        defer parts.destroy()
+        for at in 0..<node.input_count:
+            if let part = self.input(node, at):
+                try parts.append(part)
+        return try concat(parts.view(), self.int_attribute(node, "axis", 0))
+
+    func constant_node(node: const Node*) -> Tensor!:
+        let found = self.attribute(node, "value") else error(unsupported, "a Constant node gives its value in a form luce-nn does not read")
+        if found.tensor < 0:
+            error(unsupported, "a Constant node gives its value in a form luce-nn does not read")
+        return try self.values.items()[(usize)found.tensor].copy()
+
+## Up to eight axes, counted from the end when negative.
+struct Axes:
+    var values: i64[8]
+    var count: usize
+    var none_given: bool
+
+    func add(value: i64):
+        if self.count < 8:
+            self.values[self.count] = value
+            self.count += 1
+
+    ## Whether axis `axis` of a tensor of rank `rank` is among them.
+    func holds(axis: usize, rank: usize) -> bool:
+        for at in 0..<self.count:
+            let value = self.values[at]
+            if (usize)(value + (i64)rank if value < 0 else value) == axis:
+                return true
+        return false

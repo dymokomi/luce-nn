@@ -1,0 +1,63 @@
+#==============================================================================================
+#
+#   nn/parallel - Independent work items on every processor
+#
+#   DESCRIPTION:
+#       `parallel(count, context, work)` runs `work(context, index)` for each index below
+#       `count`, the threads taking the next index from a shared counter. Items must write
+#       disjoint memory; the first failure stops further items and is returned once every
+#       thread is done. The same as luce-raw's and luce-develop's; luce-std is getting
+#       one (LUCE_LANG, 2026-10-06), which replaces this fragment when it lands.
+#
+#==============================================================================================
+
+
+struct Run:
+    var context: void*
+    var work: func(void*, usize) -> unit!
+    var count: usize
+    var next: @usize
+    var failed: @bool
+
+struct Share:
+    var run: Run*?
+    var failure: Error?
+
+func run_worker(raw: void*?):
+    let share = (Share*)(raw else return)
+    let job = share.run else return
+    while not job.failed.load(.acquire):
+        let index = job.next.add(1, .relaxed)
+        if index >= job.count:
+            return
+        job.work(job.context, index) catch failure:
+            share.failure = failure
+            job.failed.store(true, .release)
+            return
+
+## Run `work(context, index)` for every index below `count` on up to one thread
+## per processor, the caller's among them.
+pub func parallel(count: usize, context: void*, work: func(void*, usize) -> unit!) -> !:
+    var job = Run(context = context, work = work, count = count)
+    var n = (usize)os.cpus()
+    if n < 1:
+        n = 1
+    if n > 64:
+        n = 64
+    if n > count:
+        n = count if count > 0 else 1
+    var shares: Share[64]
+    var handles: thread.Handle[64]
+    var started: usize = 0
+    for at in 0..<n:
+        shares[at] = Share(run = &job)
+    for at in 1..<n:
+        handles[started] = thread.spawn(run_worker, (void*)&shares[at], name = "luce-develop") catch failure:
+            break
+        started += 1
+    run_worker((void*)&shares[0])
+    for at in 0..<started:
+        try handles[at].join()
+    for at in 0..<n:
+        if let failure = shares[at].failure:
+            error(failure.code, failure.message)

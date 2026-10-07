@@ -1,0 +1,306 @@
+#==============================================================================================
+#
+#   nn/elementwise - Arithmetic with broadcasting, comparisons, Where, and unary functions
+#
+#   DESCRIPTION:
+#       Binary operators broadcast as numpy does. The output is walked a row (its last
+#       axis) at a time; along a row each operand either steps by one or stays put (it
+#       was stretched), so every row is one of three simple loops, chosen once per row,
+#       that Luce Base runs as SIMD. Float32 runs in float32; int64 (shapes and indices)
+#       in int64, where Div truncates toward zero as ONNX's integer Div does.
+#
+#==============================================================================================
+
+enum Arithmetic:
+    add
+    sub
+    mul
+    div
+    pow
+    equal
+
+enum Unary:
+    sqrt
+    relu
+    erf
+    sigmoid
+    tanh_of
+    exp_of
+    neg
+
+## Walks a broadcast output row by row: the offsets of up to three operands at the
+## start of each row, and how each steps along it.
+struct Walk:
+    var rank: usize
+    var dims: i64[8]
+    var index: i64[8]
+    var strides: i64[24]
+    var offsets: i64[3]
+    var rows: usize
+    var row_length: usize
+
+    ## A walk over shape `dims[..<rank]`; each operand's strides are set after.
+    static func over(dims: i64[8], rank: usize) -> Walk:
+        var out = Walk(rank = rank, dims = dims)
+        var total: usize = 1
+        for axis in 0..<rank:
+            total *= (usize)dims[axis]
+        out.row_length = (usize)dims[rank - 1] if rank > 0 else 1
+        out.rows = total // out.row_length if out.row_length > 0 else 0
+        return out
+
+    ## Operand `operand` read as shape `shape` broadcast to the walk's.
+    func broadcasting(operand: usize, shape: const i64[]):
+        var steps: i64[8]
+        broadcast_strides(shape, self.rank, steps)
+        self.stepping(operand, steps[..<self.rank])
+
+    ## Operand `operand` read with element strides `steps`, one per axis.
+    func stepping(operand: usize, steps: const i64[]):
+        for axis in 0..<self.rank:
+            self.strides[operand * 8 + axis] = steps[axis]
+
+    ## Operand `operand`'s step along a row (0 or 1, or its stride).
+    func step(operand: usize) -> i64:
+        return self.strides[operand * 8 + self.rank - 1] if self.rank > 0 else 0
+
+    ## Move to the next row.
+    func next():
+        if self.rank < 2:
+            return
+        var axis = self.rank - 1
+        while axis > 0:
+            axis -= 1
+            self.index[axis] += 1
+            for operand in 0..<(usize)3:
+                self.offsets[operand] += self.strides[operand * 8 + axis]
+            if self.index[axis] < self.dims[axis]:
+                return
+            for operand in 0..<(usize)3:
+                self.offsets[operand] -= self.strides[operand * 8 + axis] * self.dims[axis]
+            self.index[axis] = 0
+
+## `a` op `b`, broadcast.
+func binary(a: const Tensor*, b: const Tensor*, op: Arithmetic) -> Tensor!:
+    var dims: i64[8]
+    let rank = try broadcast(a.shape(), b.shape(), dims)
+    let floats = a.dtype == DType.float32 and b.dtype == DType.float32
+    if not floats and (a.dtype == DType.float32 or b.dtype == DType.float32):
+        error(invalid, "a binary operator mixes element types")
+    let out_type = DType.boolean if op == Arithmetic.equal else a.dtype
+    var out = try Tensor.of(out_type, dims[..<rank])
+    errdefer out.release()
+    var walk = Walk.over(dims, rank)
+    walk.broadcasting(0, a.shape())
+    walk.broadcasting(1, b.shape())
+    let length = walk.row_length
+    for row in 0..<walk.rows:
+        let at = row * length
+        let a_at = (usize)walk.offsets[0]
+        let b_at = (usize)walk.offsets[1]
+        if floats and op != Arithmetic.equal:
+            float_row(op, out.floats[at..<at + length], a.floats, a_at, walk.step(0), b.floats, b_at, walk.step(1))
+        else:
+            for column in 0..<length:
+                let x = (usize)((i64)a_at + walk.step(0) * (i64)column)
+                let y = (usize)((i64)b_at + walk.step(1) * (i64)column)
+                if op == Arithmetic.equal:
+                    out.ints[at + column] = 1 if a.float_at(x) == b.float_at(y) else 0
+                else:
+                    out.ints[at + column] = try int_op(op, a.ints[x], b.ints[y])
+        walk.next()
+    return out
+
+## One row of float32 `a` op `b`: `a` from `a_at` stepping `a_step` (0 or 1), `b` alike.
+func float_row(op: Arithmetic, out: f32[], a: const f32[], a_at: usize, a_step: i64, b: const f32[], b_at: usize, b_step: i64):
+    let length = out.length
+    if a_step == 1 and b_step == 1:
+        let x = a[a_at..<a_at + length]
+        let y = b[b_at..<b_at + length]
+        match op:
+            .add:
+                for at in 0..<length:
+                    out[at] = x[at] + y[at]
+            .sub:
+                for at in 0..<length:
+                    out[at] = x[at] - y[at]
+            .mul:
+                for at in 0..<length:
+                    out[at] = x[at] * y[at]
+            .div:
+                for at in 0..<length:
+                    out[at] = x[at] / y[at]
+            _:
+                for at in 0..<length:
+                    out[at] = power(x[at], y[at])
+        return
+    if b_step == 0:
+        let x = a[a_at..<a_at + (length if a_step == 1 else 1)]
+        let y = b[b_at]
+        match op:
+            .add:
+                if a_step == 1:
+                    for at in 0..<length:
+                        out[at] = x[at] + y
+                else:
+                    for at in 0..<length:
+                        out[at] = x[0] + y
+            .sub:
+                if a_step == 1:
+                    for at in 0..<length:
+                        out[at] = x[at] - y
+                else:
+                    for at in 0..<length:
+                        out[at] = x[0] - y
+            .mul:
+                if a_step == 1:
+                    for at in 0..<length:
+                        out[at] = x[at] * y
+                else:
+                    for at in 0..<length:
+                        out[at] = x[0] * y
+            .div:
+                # Division by a constant is multiplication by its reciprocal in
+                # onnxruntime too only when exact; keep the division.
+                for at in 0..<length:
+                    out[at] = x[at if a_step == 1 else 0] / y
+            _:
+                if y == 2.0:
+                    for at in 0..<length:
+                        out[at] = x[at if a_step == 1 else 0] * x[at if a_step == 1 else 0]
+                else:
+                    for at in 0..<length:
+                        out[at] = power(x[at if a_step == 1 else 0], y)
+        return
+    # `a` stays, `b` steps.
+    let x = a[a_at]
+    let y = b[b_at..<b_at + length]
+    match op:
+        .add:
+            for at in 0..<length:
+                out[at] = x + y[at]
+        .sub:
+            for at in 0..<length:
+                out[at] = x - y[at]
+        .mul:
+            for at in 0..<length:
+                out[at] = x * y[at]
+        .div:
+            for at in 0..<length:
+                out[at] = x / y[at]
+        _:
+            for at in 0..<length:
+                out[at] = power(x, y[at])
+
+func power(x: f32, y: f32) -> f32:
+    return x * x if y == 2.0 else math32.pow(x, y)
+
+func int_op(op: Arithmetic, x: i64, y: i64) -> i64!:
+    if op == Arithmetic.div and y == 0:
+        error(invalid, "an integer division by zero")
+    return match op:
+        .add => x + y
+        .sub => x - y
+        .mul => x * y
+        .div => x // y
+        _ => int_power(x, y)
+
+func int_power(x: i64, y: i64) -> i64:
+    var out: i64 = 1
+    for _ in 0..<(y if y > 0 else 0):
+        out *= x
+    return out
+
+## Where(condition, x, y), broadcast over all three.
+func where_of(condition: const Tensor*, x: const Tensor*, y: const Tensor*) -> Tensor!:
+    var first: i64[8]
+    let first_rank = try broadcast(condition.shape(), x.shape(), first)
+    var dims: i64[8]
+    let rank = try broadcast(first[..<first_rank], y.shape(), dims)
+    if x.dtype != y.dtype:
+        error(invalid, "Where's choices differ in element type")
+    var out = try Tensor.of(x.dtype, dims[..<rank])
+    errdefer out.release()
+    var walk = Walk.over(dims, rank)
+    walk.broadcasting(0, condition.shape())
+    walk.broadcasting(1, x.shape())
+    walk.broadcasting(2, y.shape())
+    let length = walk.row_length
+    for row in 0..<walk.rows:
+        for column in 0..<length:
+            let asked = (usize)(walk.offsets[0] + walk.step(0) * (i64)column)
+            let yes = (usize)(walk.offsets[1] + walk.step(1) * (i64)column)
+            let no = (usize)(walk.offsets[2] + walk.step(2) * (i64)column)
+            let chosen = condition.int_at(asked) != 0
+            if out.dtype == DType.float32:
+                out.floats[row * length + column] = x.floats[yes] if chosen else y.floats[no]
+            else:
+                out.ints[row * length + column] = x.ints[yes] if chosen else y.ints[no]
+        walk.next()
+    return out
+
+## A float32 function of every element.
+func unary(x: const Tensor*, op: Unary) -> Tensor!:
+    if x.dtype != DType.float32:
+        if op == Unary.neg:
+            var out = try x.copy()
+            for at in 0..<out.ints.length:
+                out.ints[at] = -out.ints[at]
+            return out
+        error(unsupported, "a unary operator on a non-float tensor")
+    var out = try Tensor.float32(x.shape())
+    errdefer out.release()
+    var job = Mapping(x = x.floats, y = out.floats, op = op)
+    let items = (x.floats.length + mapping_chunk - 1) // mapping_chunk
+    if x.floats.length < 65536:
+        for item in 0..<items:
+            try unary_item((void*)&job, item)
+    else:
+        try parallel(items, (void*)&job, unary_item)
+    return out
+
+## Elements per work item of a unary function.
+let mapping_chunk: usize = 16384
+
+struct Mapping:
+    var x: const f32[]
+    var y: f32[]
+    var op: Unary
+
+func unary_item(context: void*, item: usize) -> !:
+    let job = (Mapping*)context
+    let first = item * mapping_chunk
+    let end = first + mapping_chunk if first + mapping_chunk < job.y.length else job.y.length
+    let y = job.y[first..<end]
+    let a = job.x[first..<end]
+    match job.op:
+        .sqrt:
+            for at in 0..<y.length:
+                y[at] = math32.sqrt(a[at])
+        .relu:
+            for at in 0..<y.length:
+                y[at] = a[at] if a[at] > 0.0 else 0.0
+        .erf:
+            for at in 0..<y.length:
+                y[at] = erf32(a[at])
+        .sigmoid:
+            for at in 0..<y.length:
+                y[at] = 1.0 / (1.0 + math32.exp(-a[at]))
+        .tanh_of:
+            for at in 0..<y.length:
+                y[at] = math32.tanh(a[at])
+        .exp_of:
+            for at in 0..<y.length:
+                y[at] = math32.exp(a[at])
+        .neg:
+            for at in 0..<y.length:
+                y[at] = -a[at]
+
+## The error function in float precision: Abramowitz and Stegun 7.1.26 (absolute
+## error under 1.5e-7). Until luce-std's math32 has erf (LUCE_LANG, 2026-10-06).
+func erf32(x: f32) -> f32:
+    let sign: f64 = -1.0 if x < 0.0 else 1.0
+    let a = math.abs((f64)x)
+    let t = 1.0 / (1.0 + 0.3275911 * a)
+    let poly = ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t
+    return (f32)(sign * (1.0 - poly * math.exp(-a * a)))

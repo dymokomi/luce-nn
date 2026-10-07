@@ -1,0 +1,171 @@
+#==============================================================================================
+#
+#   nn/gemm - C = A·B on float32, blocked and on every processor
+#
+#   DESCRIPTION:
+#       Row-major A (m × k), B (k × n) and C (m × n). The work is cut into blocks of
+#       rows times tiles of columns, one block per work item, so wide products (a
+#       convolution's few output channels over many pixels) spread as well as tall ones.
+#       Within a block, four rows of C's tile at a time gather A's rows against B's
+#       rows: each loaded b[j] feeds four multiply-adds (a register-blocked micro-
+#       kernel, about twice the one-row loop even while Luce Base runs it scalar; see
+#       tests/bench/vectorizer.lucb). Leftover rows take the one-row loop, which runs
+#       as SIMD. C's tile stays in the first cache while B's tile streams from the
+#       second.
+#
+#==============================================================================================
+
+## Rows of C per work item, and the columns of a tile.
+let gemm_rows: usize = 8
+let gemm_columns: usize = 256
+
+struct Product:
+    var left: const f32[]
+    var right: const f32[]
+    var result: f32[]
+    var m: usize
+    var n: usize
+    var k: usize
+    var tiles: usize
+
+## C (m × n) = A (m × k) · B (k × n), every slice row-major and exactly that size.
+func gemm(left: const f32[], right: const f32[], result: f32[], m: usize, n: usize, k: usize) -> !:
+    if left.length < m * k or right.length < k * n or result.length < m * n:
+        error(invalid, "a matrix product's operands are smaller than their shapes")
+    if m == 0 or n == 0:
+        return
+    var job = Product(left = left, right = right, result = result, m = m, n = n, k = k, tiles = (n + gemm_columns - 1) // gemm_columns)
+    let blocks = (m + gemm_rows - 1) // gemm_rows
+    let items = blocks * job.tiles
+    # Small products are not worth waking threads for.
+    if m * n * k < 65536:
+        for item in 0..<items:
+            try gemm_block((void*)&job, item)
+        return
+    try parallel(items, (void*)&job, gemm_block)
+
+func gemm_block(context: void*, item: usize) -> !:
+    let job = (Product*)context
+    let row_first = (item // job.tiles) * gemm_rows
+    let row_end = row_first + gemm_rows if row_first + gemm_rows < job.m else job.m
+    let column = (item % job.tiles) * gemm_columns
+    let width = gemm_columns if column + gemm_columns <= job.n else job.n - column
+    var row = row_first
+    while row + 4 <= row_end:
+        let c0 = job.result[row * job.n + column..<row * job.n + column + width]
+        let c1 = job.result[(row + 1) * job.n + column..<(row + 1) * job.n + column + width]
+        let c2 = job.result[(row + 2) * job.n + column..<(row + 2) * job.n + column + width]
+        let c3 = job.result[(row + 3) * job.n + column..<(row + 3) * job.n + column + width]
+        for at in 0..<width:
+            c0[at] = 0.0
+            c1[at] = 0.0
+            c2[at] = 0.0
+            c3[at] = 0.0
+        for inner in 0..<job.k:
+            let b = job.right[inner * job.n + column..<inner * job.n + column + width]
+            four_rows(c0, c1, c2, c3, b, job.left[row * job.k + inner], job.left[(row + 1) * job.k + inner],
+                      job.left[(row + 2) * job.k + inner], job.left[(row + 3) * job.k + inner])
+        row += 4
+    while row < row_end:
+        let c_row = job.result[row * job.n + column..<row * job.n + column + width]
+        for at in 0..<width:
+            c_row[at] = 0.0
+        let a_row = job.left[row * job.k..<row * job.k + job.k]
+        for inner in 0..<job.k:
+            let weight = a_row[inner]
+            if weight != 0.0:
+                axpy(c_row, job.right[inner * job.n + column..<inner * job.n + column + width], weight)
+        row += 1
+
+## Four rows of C gain their A weights times B's row: one load of b feeds four
+## multiply-adds.
+func four_rows(c0: f32[], c1: f32[], c2: f32[], c3: f32[], b: const f32[], a0: f32, a1: f32, a2: f32, a3: f32):
+    let length = c0.length
+    let r1 = c1[..<length]
+    let r2 = c2[..<length]
+    let r3 = c3[..<length]
+    let run = b[..<length]
+    for at in 0..<length:
+        let value = run[at]
+        c0[at] = c0[at] + a0 * value
+        r1[at] = r1[at] + a1 * value
+        r2[at] = r2[at] + a2 * value
+        r3[at] = r3[at] + a3 * value
+
+## target += weight·source, elementwise (source at least as long as target).
+func axpy(target: f32[], source: const f32[], weight: f32):
+    let length = target.length
+    # Cut to the same length, so the loop's bounds are proven and it runs as SIMD.
+    let run = source[..<length]
+    for at in 0..<length:
+        target[at] = target[at] + weight * run[at]
+
+## MatMul as numpy's: [..., m, k] · [..., k, n], the leading (batch) axes broadcast;
+## a vector on either side is a matrix of one row (left) or one column (right).
+func matmul(a: const Tensor*, b: const Tensor*) -> Tensor!:
+    if a.dtype != DType.float32 or b.dtype != DType.float32:
+        error(unsupported, "MatMul on a non-float tensor")
+    if a.rank == 0 or b.rank == 0:
+        error(invalid, "MatMul of a scalar")
+    var a_dims: i64[8]
+    var b_dims: i64[8]
+    let a_rank = a.rank if a.rank >= 2 else 2
+    let b_rank = b.rank if b.rank >= 2 else 2
+    if a.rank == 1:
+        a_dims[0] = 1
+        a_dims[1] = a.dims[0]
+    else:
+        for axis in 0..<a.rank:
+            a_dims[axis] = a.dims[axis]
+    if b.rank == 1:
+        b_dims[0] = b.dims[0]
+        b_dims[1] = 1
+    else:
+        for axis in 0..<b.rank:
+            b_dims[axis] = b.dims[axis]
+    let m = (usize)a_dims[a_rank - 2]
+    let k = (usize)a_dims[a_rank - 1]
+    let n = (usize)b_dims[b_rank - 1]
+    if (usize)b_dims[b_rank - 2] != k:
+        error(invalid, "MatMul's inner dimensions differ")
+    var batch: i64[8]
+    let batch_rank = try broadcast(a_dims[..<a_rank - 2], b_dims[..<b_rank - 2], batch)
+    var dims: i64[8]
+    var rank: usize = 0
+    for axis in 0..<batch_rank:
+        dims[rank] = batch[axis]
+        rank += 1
+    if a.rank >= 2:
+        dims[rank] = (i64)m
+        rank += 1
+    if b.rank >= 2:
+        dims[rank] = (i64)n
+        rank += 1
+    var out = try Tensor.float32(dims[..<rank])
+    errdefer out.release()
+    # Batch strides in whole matrices, 0 where a side is broadcast.
+    var a_batch: i64[8]
+    var b_batch: i64[8]
+    broadcast_strides(a_dims[..<a_rank - 2], batch_rank, a_batch)
+    broadcast_strides(b_dims[..<b_rank - 2], batch_rank, b_batch)
+    var count: usize = 1
+    for axis in 0..<batch_rank:
+        count *= (usize)batch[axis]
+    var index: i64[8]
+    for item in 0..<count:
+        var a_at: i64 = 0
+        var b_at: i64 = 0
+        for axis in 0..<batch_rank:
+            a_at += index[axis] * a_batch[axis]
+            b_at += index[axis] * b_batch[axis]
+        let a_first = (usize)a_at * m * k
+        let b_first = (usize)b_at * k * n
+        try gemm(a.floats[a_first..<a_first + m * k], b.floats[b_first..<b_first + k * n], out.floats[item * m * n..<(item + 1) * m * n], m, n, k)
+        var axis = batch_rank
+        while axis > 0:
+            axis -= 1
+            index[axis] += 1
+            if index[axis] < batch[axis]:
+                break
+            index[axis] = 0
+    return out

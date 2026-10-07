@@ -1,0 +1,173 @@
+## Hold every operator to onnxruntime: for each case in FIXTURES/cases.txt (made by
+## make_fixtures.py), load <case>.onnx, set the inputs of <case>.tensors, run, and
+## compare each output with onnxruntime's, element by element, within `absolute` plus
+## `relative` of its size. Prints one line per case and fails if any case does.
+##
+##     op_check [FIXTURES]
+##     op_check --model MODEL.onnx MODEL.tensors   (a whole model: make_model_fixture.py)
+import c
+import interop
+import strings
+import time
+from luce_std import files
+from luce_std import math
+from luce_std import paths
+from luce_std.collections import List
+from luce_nn import nn
+
+let absolute: f64 = 1.0e-4
+let relative: f64 = 1.0e-4
+
+## Reads a .tensors file.
+struct Reader:
+    var data: const u8[]
+    var at: usize
+
+    func u32() -> u32!:
+        if self.at + 4 > self.data.length:
+            error(nn.malformed, "a .tensors file ends early")
+        var value: u32 = 0
+        for byte in 0..<(usize)4:
+            value |= (u32)self.data[self.at + byte] << (u32)(byte * 8)
+        self.at += 4
+        return value
+
+    func take(count: usize) -> const u8[]!:
+        if self.at + count > self.data.length:
+            error(nn.malformed, "a .tensors file ends early")
+        let start = self.at
+        self.at += count
+        return self.data[start..<self.at]
+
+func read_file(path: str) -> interop.Owned[const u8[]]!:
+    let terminated = try strings.copy(path)
+    defer strings.release(terminated)
+    return try files.read((c.str)terminated)
+
+## What a check found: the worst difference relative to the tolerance (≤ 1 passes),
+## the largest absolute difference, and how long the run took.
+struct Found:
+    var worst: f64
+    var largest: f64
+    var milliseconds: i64
+
+## Run case `name` of `folder`.
+func check(folder: str, name: str) -> Found!:
+    let model_path = try paths.join(folder, name)
+    defer model_path.release()
+    var onnx_path: u8[1024]
+    var tensors_path: u8[1024]
+    return try check_files(try strings.format(onnx_path, f"{model_path.value}.onnx"), try strings.format(tensors_path, f"{model_path.value}.tensors"))
+
+## Run the model at `onnx` on the inputs of `tensors` and compare its outputs.
+func check_files(onnx: str, tensors: str, profile: bool = false) -> Found!:
+    var model = try nn.Model.open(onnx)
+    defer model.close()
+    model.profiling = profile
+    let read = try read_file(tensors)
+    defer read.release()
+    var reader = Reader(data = read.value)
+    if (str)(try reader.take(4)) != "LNNT":
+        error(nn.malformed, "not a .tensors file")
+    let count = try reader.u32()
+    # Inputs are set as they come; expected outputs are compared after the run.
+    var expected_at: List[usize]
+    defer expected_at.destroy()
+    for _ in 0..<count:
+        let start = reader.at
+        let name_length = (usize)(try reader.u32())
+        let tensor_name = (str)(try reader.take(name_length))
+        let role = try reader.u32()
+        let kind = try reader.u32()
+        let rank = (usize)(try reader.u32())
+        var dims: i64[8]
+        var total: usize = 1
+        for axis in 0..<rank:
+            let low = (u64)(try reader.u32())
+            let high = (u64)(try reader.u32())
+            dims[axis] = (i64)(low | (high << 32))
+            total *= (usize)dims[axis]
+        let width: usize = 4 if kind == 1 else (8 if kind == 7 else 1)
+        let bytes = try reader.take(total * width)
+        if role == 0:
+            if kind != 1:
+                error(nn.unsupported, "a fixture input is not float32")
+            let floats = f32[]((f32*)bytes.data, total)
+            try model.set_input(tensor_name, dims[..<rank], floats)
+        else:
+            try expected_at.append(start)
+    let started = time.now()
+    try model.run()
+    let spent = (i64)((time.now() - started) // 1000000)
+    var worst = 0.0
+    var largest = 0.0
+    for start in expected_at.view():
+        reader.at = start
+        let name_length = (usize)(try reader.u32())
+        let tensor_name = (str)(try reader.take(name_length))
+        _ = try reader.u32()
+        let kind = try reader.u32()
+        let rank = (usize)(try reader.u32())
+        var total: usize = 1
+        var dims: i64[8]
+        for axis in 0..<rank:
+            let low = (u64)(try reader.u32())
+            let high = (u64)(try reader.u32())
+            dims[axis] = (i64)(low | (high << 32))
+            total *= (usize)dims[axis]
+        let found = model.output(tensor_name) else error(nn.invalid, "the run made no such output")
+        if found.rank != rank:
+            error(nn.invalid, "an output's rank differs from onnxruntime's")
+        for axis in 0..<rank:
+            if found.dims[axis] != dims[axis]:
+                error(nn.invalid, "an output's shape differs from onnxruntime's")
+        if kind != 1:
+            error(nn.unsupported, "a fixture output is not float32")
+        let theirs = f32[]((f32*)(try reader.take(total * 4)).data, total)
+        for at in 0..<total:
+            let difference = math.abs((f64)found.floats[at] - (f64)theirs[at])
+            largest = math.max(largest, difference)
+            let allowed = absolute + relative * math.abs((f64)theirs[at])
+            let measured = difference / allowed if not math.is_nan(difference) else 1.0e9
+            worst = math.max(worst, measured)
+    if profile:
+        for op in ["MatMul", "Conv", "ConvTranspose", "Resize", "Add", "Mul", "Div", "Sub", "Pow", "Sqrt", "Erf", "ReduceMean", "Softmax", "Transpose", "Reshape", "Concat", "Gather", "Slice", "Relu"]:
+            let nanoseconds = model.time_in(op)
+            if nanoseconds >= 1000000:
+                print(f"  {op}: {nanoseconds // 1000000} ms")
+    return Found(worst = worst, largest = largest, milliseconds = spent)
+
+pub func main(arguments: str[]) -> i32!:
+    if arguments.length == 4 and arguments[1] == "--model":
+        let found = try check_files(arguments[2], arguments[3], profile = true)
+        print(f"{arguments[2]}: run {found.milliseconds} ms, largest difference {found.largest}, {found.worst} of the tolerance")
+        return 0 if found.worst <= 1.0 else 1
+    let folder = arguments[1] if arguments.length > 1 else "tests/fixtures"
+    let list_path = try paths.join(folder, "cases.txt")
+    defer list_path.release()
+    let listed = try read_file(list_path.value)
+    defer listed.release()
+    var failed: i64 = 0
+    var passed: i64 = 0
+    let text = (str)listed.value
+    var first: usize = 0
+    while first < text.length:
+        var end = first
+        while end < text.length and text.bytes[end] != '\n':
+            end += 1
+        let line = (str)text.bytes[first..<end]
+        first = end + 1
+        if line.length == 0:
+            continue
+        let found = check(folder, line) catch failure:
+            print(f"FAIL  {line}: {failure.message}")
+            failed += 1
+            continue
+        if found.worst <= 1.0:
+            print(f"ok    {line}  ({found.worst} of the tolerance)")
+            passed += 1
+        else:
+            print(f"FAIL  {line}: {found.worst} times the tolerance")
+            failed += 1
+    print(f"{passed} passed, {failed} failed")
+    return 1 if failed > 0 else 0

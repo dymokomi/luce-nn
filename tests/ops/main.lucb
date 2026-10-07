@@ -3,8 +3,12 @@
 ## compare each output with onnxruntime's, element by element, within `absolute` plus
 ## `relative` of its size. Prints one line per case and fails if any case does.
 ##
-##     op_check [FIXTURES]
-##     op_check --model MODEL.onnx MODEL.tensors   (a whole model: make_model_fixture.py)
+##     ops [FIXTURES]
+##     ops --model MODEL.onnx MODEL.tensors   (a whole model: make_model_fixture.py)
+##
+## With no arguments it also runs every whole model kept in build/models (a
+## <name>.onnx beside its <name>.tensors, as make_model_fixture.py leaves them);
+## models are not in the repository, so a fresh checkout has none.
 import c
 import interop
 import strings
@@ -169,5 +173,37 @@ pub func main(arguments: str[]) -> i32!:
         else:
             print(f"FAIL  {line}: {found.worst} times the tolerance")
             failed += 1
+    if arguments.length <= 1:
+        failed += try check_models()
     print(f"{passed} passed, {failed} failed")
     return 1 if failed > 0 else 0
+
+## Run every whole model in build/models that has its fixture; how many failed.
+func check_models() -> i64!:
+    if not files.exists("build/models"):
+        return 0
+    let listed = try files.list("build/models")
+    defer listed.release()
+    var failed: i64 = 0
+    for name in listed.value:
+        if name.length <= 5 or (str)name.bytes[name.length - 5..] != ".onnx":
+            continue
+        let stem = (str)name.bytes[..<name.length - 5]
+        var onnx_text: u8[1024]
+        var tensors_text: u8[1024]
+        let onnx = try strings.format(onnx_text, f"build/models/{name}")
+        let tensors = try strings.format(tensors_text, f"build/models/{stem}.tensors")
+        let terminated = try strings.copy(tensors)
+        let present = files.exists((c.str)terminated)
+        strings.release(terminated)
+        if not present:
+            continue
+        let found = check_files(onnx, tensors) catch failure:
+            print(f"FAIL  {name}: {failure.message}")
+            failed += 1
+            continue
+        let verdict = "ok  " if found.worst <= 1.0 else "FAIL"
+        print(f"{verdict}  {name} whole: run {found.milliseconds} ms, largest difference {found.largest}, {found.worst} of the tolerance")
+        if found.worst > 1.0:
+            failed += 1
+    return failed

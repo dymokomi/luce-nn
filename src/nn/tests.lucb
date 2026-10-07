@@ -3,7 +3,7 @@
 #   nn/tests - Tests on the pieces: the wire format, names, broadcasting, gemm, resizing
 #
 #   DESCRIPTION:
-#       Whole operators and models are held to onnxruntime by tests/op_check.lucb.
+#       Whole operators and models are held to onnxruntime by tests/ops.
 #
 #==============================================================================================
 

@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Write build/models/<model>.tensors: a photo prepared as Depth Anything expects it
 (the long side 518, both sides multiples of 14, ImageNet normalization) and
-onnxruntime's depth for it, for tests/model_check.lucb. The model and the photo are
-the caller's (not in the repository):
+onnxruntime's depth for it, and copy the model beside it as build/models/<model>.onnx,
+where tests/ops runs it whole. The model and the photo are the caller's (not in the
+repository):
 
     build/venv/bin/python tests/make_model_fixture.py MODEL.onnx PHOTO.jpg
 """
 from pathlib import Path
-import sys, time
+import shutil, sys, time
 import numpy as np
 from PIL import Image, ImageOps
 import onnxruntime as ort
@@ -30,4 +31,6 @@ print(f"onnxruntime: {(time.perf_counter() - started) * 1000:.0f} ms for {size[0
 out = Path(__file__).resolve().parents[1] / "build/models"
 out.mkdir(parents=True, exist_ok=True)
 write_tensors(out / f"{model.stem}.tensors", {name: x}, {session.get_outputs()[0].name: depth})
+if model.resolve() != (out / model.name).resolve():
+    shutil.copyfile(model, out / f"{model.stem}.onnx")
 print(out / f"{model.stem}.tensors")

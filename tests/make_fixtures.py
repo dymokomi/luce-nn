@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Write tests/fixtures: one small ONNX model per operator case, its inputs, and
-onnxruntime's outputs for them, for tests/op_check.lucb to hold luce-nn to.
+onnxruntime's outputs for them, for tests/ops to hold luce-nn to.
 
     python3 -m venv build/venv && build/venv/bin/pip install onnx onnxruntime numpy
     build/venv/bin/python tests/make_fixtures.py

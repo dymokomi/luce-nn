@@ -41,19 +41,19 @@ Depth Anything V2 Small runs in about 1.1 s on an M-series Mac, on CPU. That is
 onnxruntime's whole-model result within 1e-4. Most of the time goes to the matrix
 products: `gemm` uses a 4-row register-blocked kernel. `tests/bench/vectorizer.lucb`
 measures the loops whose speed depends on Luce Base's SIMD vectorizer, which is being
-improved for them. A GPU backend through luce-gpu compute is the next step.
+improved for them. A GPU backend through luce-gpu compute has not been started.
 
 ## Tests
 
-`./test.sh` (tests/run.py) runs the module's tests and then every case of
-`tests/fixtures`, in native and C builds. Each case is a small ONNX model whose
-expected output comes from onnxruntime; there are 63 cases covering every operator
-and its broadcasting, padding and resize variants. `tests/make_fixtures.py`
-regenerates them.
+`luc test` runs the module's tests and `tests/ops`, which runs every case of
+`tests/fixtures`. Each case is a small ONNX model whose expected output comes from
+onnxruntime; there are 63 cases covering every operator and its broadcasting,
+padding and resize variants. `tests/make_fixtures.py` regenerates them.
 
-To check a whole model, make its fixture from a photo with
-`tests/make_model_fixture.py MODEL.onnx PHOTO.jpg`, then run
-`./test.sh --model MODEL.onnx`. Models are not kept in the repository.
+To check a whole model too, make its fixture from a photo with
+`tests/make_model_fixture.py MODEL.onnx PHOTO.jpg`. That leaves the model and its
+fixture in `build/models/`, where `tests/ops` runs them on every `luc test`. Models
+are not kept in the repository.
 
 ## License
 

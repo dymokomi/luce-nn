@@ -13,7 +13,7 @@
 #       Tensors are float32, int64 (shapes, indices) or bool, dense and row-major, up to
 #       eight dimensions. The operators are the standard ONNX ones of opset 13 and later
 #       that vision models use (ops lists them); a model using any other fails to load,
-#       naming it. Results follow onnxruntime's (tests/run.py holds every operator to it,
+#       naming it. Results follow onnxruntime's (tests/ops holds every operator to it,
 #       and Depth Anything V2 as a whole).
 #
 #       Matrix products and convolutions run on every processor (gemm, parallel). The
